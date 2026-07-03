@@ -2,7 +2,7 @@
 
 A Go agent framework with provider-agnostic core types and first-class multi-provider LLM support via [models.dev](https://models.dev).
 
-**Go 1.23+** · **MIT License** · **116 providers, 2000+ models**
+**Go 1.25+** · **MIT License** · **116 providers, 2000+ models**
 
 ## Why Goa?
 
@@ -19,7 +19,7 @@ go get github.com/codeownersnet/goa
 ```
 
 **Prerequisites**:
-- Go 1.23+ (required for `iter.Seq2` streaming)
+- Go 1.25+ (required for `iter.Seq2` streaming)
 - API keys for your chosen providers (set as environment variables)
 
 Goa has minimal dependencies — `gopkg.in/yaml.v3` (skill and workflow parsing), `github.com/stretchr/testify` (testing), `github.com/mattn/go-sqlite3` (persistent sessions), and `github.com/modelcontextprotocol/go-sdk/mcp` (MCP toolset).
@@ -184,7 +184,7 @@ myAgent, err := llmagent.New(llmagent.Config{
 })
 ```
 
-`llmagent.Config` fields: `Name`, `Description`, `SubAgents`, `Model`, `Instruction`, `Tools`, `GenerateConfig`, `BeforeAgentCallbacks`, `AfterAgentCallbacks`.
+`llmagent.Config` fields: `Name`, `Description`, `SubAgents`, `Model`, `Instruction`, `Tools`, `GenerateConfig`, `RequestProcessors`, `RequireToolUse`, `BeforeAgentCallbacks`, `AfterAgentCallbacks`.
 
 Model and tool-level callbacks (`BeforeModelCallbacks`, `AfterModelCallbacks`, `OnModelErrorCallbacks`, `BeforeToolCallbacks`, `AfterToolCallbacks`, `OnToolErrorCallbacks`) are configured on `flow.Flow` directly (see [Flow & Callbacks](#flow--callbacks)).
 
@@ -242,19 +242,19 @@ c := content.NewContent(content.RoleUser,
 ```go
 // Object with required fields
 weatherSchema := schema.Object(map[string]*schema.Schema{
-    "location":  schema.String(),
-    "unit":      schema.String(),  // optional
+    "location":  schema.String("City name"),
+    "unit":      schema.String("Temperature unit"),  // optional
 }, "location")
 
 // Nested types
 profileSchema := schema.Object(map[string]*schema.Schema{
-    "name": schema.String(),
-    "age":  schema.Int(),
-    "tags": schema.Array(schema.String()),
+    "name": schema.String("Full name"),
+    "age":  schema.Int("Age in years"),
+    "tags": schema.Array(schema.String("Tag"), "List of tags"),
 }, "name", "age")
 ```
 
-Helper constructors: `schema.Object()`, `schema.String()`, `schema.Int()`, `schema.Float()`, `schema.Bool()`, `schema.Array()`.
+Helper constructors: `schema.Object()`, `schema.String(desc)`, `schema.Int(desc)`, `schema.Float(desc)`, `schema.Bool(desc)`, `schema.Array(items, desc)`. All helpers except `Object` take a description string.
 
 ### Tool
 
@@ -336,8 +336,9 @@ Tool names are prefixed as `{server}_{tool}` (e.g., `filesystem_read_file`) to p
 `tool/plantool/` provides structured plan management for agents:
 
 ```go
-planTool := plantool.New()
-// Operations: create, get, show, update, reminder
+planTools, err := plantool.New()
+// Returns 4 tools: create, update, get, show
+// Use plantool.PlanReminder() for a flow.RequestProcessor that injects plan reminders
 ```
 
 ### Tool Registry
@@ -352,7 +353,7 @@ reg := toolregistry.DefaultBuiltinRegistry(
 t, err := reg.Lookup("bash")
 ```
 
-Built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_dir`, `exit_loop`, `diff`.
+Built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_dir`, `exit_loop`, `diff`, `git_clone`, `git_pull`, `git_push`, `git_add`, `git_branch`, `git_commit`, `git_stash`, `git_status`, `git_diff`, `git_log`, `git_checkout`, `github_get_pull_request`, `github_list_pr_files`, `github_list_review_comments`, `github_create_review`, `github_add_pr_comment`, `github_add_review_comment`, `github_reply_to_review_comment`.
 
 ## Streaming
 
@@ -378,7 +379,7 @@ for event, err := range r.Run(ctx, "user1", "session1", userMsg, agent.RunConfig
 - `event.Partial` — `true` for incremental chunks, `false` for the final event
 - `event.IsFinalResponse()` — returns `true` when the response is complete
 
-`flow.StreamingResponseAggregator` accumulates partial SSE chunks into a single complete response (text concatenation, function call accumulation).
+Provider adapters accumulate SSE chunks internally — text is concatenated and function call arguments are buffered until complete — yielding partial `ModelResponse` events that the `Flow` passes through as `session.Event` objects with `Partial = true`.
 
 ## Provider Registry & Model Resolution
 
@@ -408,7 +409,7 @@ model, err := reg.Resolve(ctx, "openai/gpt-4o", provider.WithAPIKey("sk-..."))
 **AdapterFactory interface**:
 ```go
 type AdapterFactory interface {
-    NewModel(ctx context.Context, entry *ModelEntry, opts ...Option) (model.Model, error)
+    NewModel(ctx context.Context, entry *ModelEntry, opts ...ProviderOption) (model.Model, error)
 }
 ```
 
@@ -510,7 +511,7 @@ Each step:
 4. **HandleTools** — executes function calls from the model response (concurrently by default)
 5. **Loop** — repeats until a final response (no more function calls) or `MaxIterations` reached
 
-`flow.Flow` fields: `Model`, `Tools`, `Instruction`, `GenerateConfig`, `MaxIterations` (default 25), `ToolTimeout` (default 120s), `RequestProcessors`, `ResponseProcessors`, `BeforeModelCallbacks`, `AfterModelCallbacks`, `OnModelErrorCallbacks`, `BeforeToolCallbacks`, `AfterToolCallbacks`, `OnToolErrorCallbacks`.
+`flow.Flow` fields: `Model`, `Tools`, `Instruction`, `GenerateConfig`, `MaxIterations` (default 25), `ToolTimeout` (default 120s), `RequestProcessors`, `ResponseProcessors`, `RequireToolUse`, `BeforeModelCallbacks`, `AfterModelCallbacks`, `OnModelErrorCallbacks`, `BeforeToolCallbacks`, `AfterToolCallbacks`, `OnToolErrorCallbacks`.
 
 Doom loop detection: if the same tool call signature repeats 3+ consecutive times, a warning is logged. After 2 doom loop detections, the flow terminates with an error.
 
@@ -679,7 +680,7 @@ svc := memory.InMemoryService()
 err := svc.AddSessionToMemory(ctx, session)
 
 // Search across indexed sessions
-resp, err := svc.SearchMemory(ctx, memory.SearchRequest{
+resp, err := svc.SearchMemory(ctx, &memory.SearchRequest{
     AppName: "my-app",
     UserID:  "user1",
     Query:   "previous conversation about weather",
