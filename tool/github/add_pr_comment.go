@@ -24,7 +24,8 @@ type issueCommentResult struct {
 }
 
 func addPRComment(ctx context.Context, client *github.Client, args addPRCommentArgs) (issueCommentResult, error) {
-	comment := &github.IssueComment{Body: github.String(args.Body)}
+	body := args.Body
+	comment := &github.IssueComment{Body: &body}
 	created, resp, err := client.Issues.CreateComment(ctx, args.Owner, args.Repo, args.IssueNumber, comment)
 	if err != nil {
 		return issueCommentResult{}, fmt.Errorf("github_add_pr_comment: %w", err)
