@@ -1,0 +1,45 @@
+name: todo-audit
+description: Find all TODOs in the goa codebase and produce an audit report
+
+providers:
+  synthetic:
+    api_base: "https://api.synthetic.new/openai/v1"
+    env: ["SYNTHETIC_API_KEY"]
+
+exit_when:
+  state:
+    audit_complete: "true"
+
+steps:
+  - name: find
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      Search the goa codebase for all TODO and FIXME comments.
+      Use grep to find lines containing TODO or FIXME across all .go files.
+      Report the file paths and line numbers.
+    tools: [grep, glob]
+
+  - name: review
+    type: loop
+    max_iterations: 10
+    exit_when:
+      state:
+        todos_reviewed: "true"
+    steps:
+      - name: inspect
+        model: synthetic/hf:zai-org/GLM-4.7-Flash
+        instruction: |
+          Read the files containing TODOs found in the previous step.
+          For each TODO, categorize it: bug, feature, refactor, docs, or question.
+          If all TODOs have been reviewed, set state todos_reviewed=true and call exit_loop.
+          If there are too many to review in one pass, review what you can and continue next iteration.
+        tools: [read_file]
+
+  - name: report
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      Write a Markdown audit report to .goa/output/todo-audit.md with:
+      - Table of TODOs: file, line, category, text
+      - Summary counts by category
+      Set state audit_complete=true when done.
+    tools: [write_file]

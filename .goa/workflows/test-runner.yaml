@@ -1,0 +1,30 @@
+name: test-runner
+description: Run goa tests in a loop until they pass
+
+providers:
+  synthetic:
+    api_base: "https://api.synthetic.new/openai/v1"
+    env: ["SYNTHETIC_API_KEY"]
+
+type: loop
+max_iterations: 3
+exit_when:
+  state:
+    tests_passed: "true"
+
+steps:
+  - name: run
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      Run the test suite using: go test ./... -count=1 -race
+      If all tests pass, set state tests_passed=true and call exit_loop.
+      If any tests fail, report which packages failed so the next iteration can investigate.
+    tools: [bash]
+
+  - name: diagnose
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      If tests failed in the previous step, use grep and read_file to find the root cause.
+      Report your findings so the next iteration can address them.
+      If tests passed, call exit_loop immediately.
+    tools: [grep, read_file]

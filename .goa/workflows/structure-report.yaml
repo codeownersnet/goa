@@ -1,0 +1,38 @@
+name: structure-report
+description: Scan the goa codebase and produce a Markdown structure report
+
+providers:
+  synthetic:
+    api_base: "https://api.synthetic.new/openai/v1"
+    env: ["SYNTHETIC_API_KEY"]
+
+steps:
+  - name: scout
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      You are scanning the goa Go agent framework codebase.
+      Use glob to find all .go files, then use list_dir to map the top-level directories.
+      Produce a concise summary of the directory structure and file count per package.
+    tools: [glob, list_dir, grep]
+
+  - name: analyze
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      Given the directory structure, use grep to count exported functions (lines matching "^func [A-Z]")
+      and exported types (lines matching "^type [A-Z]" or "^var [A-Z]") per package.
+      Use read_file to inspect go.mod for the module name and Go version.
+      Summarize: module name, Go version, package count, total exports per package.
+    tools: [grep, read_file]
+
+  - name: report
+    model: synthetic/hf:zai-org/GLM-4.7-Flash
+    instruction: |
+      Write a Markdown report to .goa/output/structure-report.md with:
+      - Module name and Go version
+      - Table of packages with file count and export count
+      - Brief description of each top-level package (infer from directory name)
+      Use write_file to create the file.
+    tools: [write_file]
+    generate_config:
+      temperature: 0.2
+      max_tokens: 4096

@@ -1,0 +1,7 @@
+bin/
+coverage.out
+
+# Runtime / tool state
+.opencode/
+.goa/state/
+.goa/output/

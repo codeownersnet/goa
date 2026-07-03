@@ -1,0 +1,61 @@
+name: litellm-dev-flow
+description: Clone a repo, create a branch, update a file, run tests, commit and push using a LiteLLM gateway
+
+providers:
+  litellm:
+    api_base: "http://localhost:4000/v1"
+    env: ["LITELLM_API_KEY"]
+    type: anthropic
+
+allowed_paths:
+  - ./**
+
+exit_when:
+  state:
+    push_complete: "true"
+  timeout: 30m
+
+steps:
+  - name: clone-and-branch
+    model: litellm/gpt-4o
+    instruction: |
+      You are a developer bot. Perform the following steps in order:
+      1. Use git_clone to clone the repository into the current working directory (use "." as the target path).
+         The repo URL is provided as the workflow prompt.
+      2. Use git_checkout to create and switch to a new feature branch named "ai/update-config".
+         Use the workdir parameter to point to the cloned repo directory.
+      3. Use git_status to confirm you are on the new branch.
+      If any step fails and you cannot recover, call exit_loop to stop the workflow.
+      Report the current branch name when done.
+    tools: [git_clone, git_checkout, git_status, bash]
+
+  - name: update-file
+    model: litellm/gpt-4o
+    instruction: |
+      You are a developer bot. Your task is to make a code change in the cloned repository.
+      1. Use glob to find relevant source files in the project.
+      2. Use read_file to inspect a key configuration or source file.
+      3. Use write_file to create a new file or edit_file to apply a meaningful update (e.g., update a version constant, fix a typo, add a comment, or adjust a configuration value).
+      4. Use read_file to verify the change was applied correctly.
+      If you cannot complete the task, call exit_loop to stop the workflow.
+    tools: [glob, read_file, write_file, edit_file, grep]
+    generate_config:
+      temperature: 0.3
+      max_tokens: 4096
+
+  - name: test-and-commit
+    model: litellm/gpt-4o
+    instruction: |
+      You are a developer bot. Complete the development workflow:
+      1. Use bash to run the project's test suite. Look for a Makefile, go.test, or package.json scripts to determine the right test command.
+         If tests fail, use read_file and grep to investigate, then use edit_file to fix the issue, and re-run tests.
+      2. When tests pass, use git_add to stage all changed files.
+      3. Use git_diff to review the staged changes.
+      4. Use git_commit to commit with a descriptive message like "ai: update configuration".
+      5. Use git_push to push the branch to the remote origin.
+      6. After a successful push, set state push_complete=true.
+      If any step fails and you cannot recover, call exit_loop to stop the workflow.
+    tools: [bash, git_add, git_diff, git_commit, git_push, read_file, write_file, edit_file, grep]
+    generate_config:
+      temperature: 0.2
+      max_tokens: 4096
