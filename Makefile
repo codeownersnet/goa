@@ -1,4 +1,4 @@
-.PHONY: build test lint generate vet goafl
+.PHONY: build test lint generate vet goafl ci
 
 build:
 	go build -o bin/ ./...
@@ -21,3 +21,6 @@ generate:
 coverage:
 	go test ./... -race -coverprofile=coverage.out
 	go tool cover -func=coverage.out
+
+ci: vet lint test build
+	@echo "CI checks passed"
