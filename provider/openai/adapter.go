@@ -6,6 +6,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ type Config struct {
 	MaxRetries       int
 	InitialRetryWait time.Duration
 	MaxRetryWait     time.Duration
+	HTTPClient       *http.Client
 }
 
 type Adapter struct {
@@ -31,9 +33,13 @@ type Adapter struct {
 }
 
 func New(cfg Config) *Adapter {
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{}
+	}
 	return &Adapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: client,
 		caps:   model.ModelCapabilities{ToolCall: true, StructuredOutput: true},
 	}
 }
@@ -113,6 +119,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		}
 
 		body.Stream = true
+		body.StreamOptions = &streamOptions{IncludeUsage: true}
 
 		maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
 		resp, err := a.openStream(ctx, body, maxRetries, initialWait, maxWait)
@@ -125,21 +132,14 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		accumulator := newToolCallAccumulator()
 		scanner := newSSEScanner(resp.Body)
 
+		var usage *model.Usage
+		finishReason := model.FinishReasonStop
+
+	scan:
 		for scanner.Next() {
 			event := scanner.Event()
 			if event.Data == "[DONE]" {
-				final := accumulator.finalize()
-				if len(final) > 0 {
-					finalResp := &model.ModelResponse{
-						Content:      content.NewContent(content.RoleModel, final...),
-						TurnComplete: true,
-						Partial:      false,
-					}
-					if !yield(finalResp, nil) {
-						return
-					}
-				}
-				return
+				break scan
 			}
 
 			var chunk chatCompletionChunk
@@ -147,11 +147,18 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 				continue
 			}
 
+			if chunk.Usage != nil {
+				usage = fromOpenAIUsage(chunk.Usage)
+			}
+
 			if len(chunk.Choices) == 0 {
 				continue
 			}
 
 			choice := chunk.Choices[0]
+			if fr := fromOpenAIFinishReason(choice.FinishReason); fr != model.FinishReasonUnknown {
+				finishReason = fr
+			}
 			parts := a.processChunk(choice, accumulator)
 
 			if len(parts) > 0 {
@@ -167,7 +174,19 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 
 		if err := scanner.Err(); err != nil {
 			yield(nil, fmt.Errorf("scan sse stream: %w", err))
+			return
 		}
+
+		finalResp := &model.ModelResponse{
+			TurnComplete: true,
+			Partial:      false,
+			Usage:        usage,
+			FinishReason: finishReason,
+		}
+		if final := accumulator.finalize(); len(final) > 0 {
+			finalResp.Content = content.NewContent(content.RoleModel, final...)
+		}
+		yield(finalResp, nil)
 	}
 }
 
@@ -268,10 +287,20 @@ func (a *toolCallAccumulator) finalize() []content.Part {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	var parts []content.Part
-	for i, fc := range a.calls {
-		args := parseArgsJSON(a.argsBuffers[i].String())
-		fc.Args = args
+	indices := make([]int, 0, len(a.calls))
+	for i := range a.calls {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+
+	parts := make([]content.Part, 0, len(indices))
+	for _, i := range indices {
+		fc := a.calls[i]
+		buf, ok := a.argsBuffers[i]
+		if !ok {
+			continue
+		}
+		fc.Args = parseArgsJSON(buf.String())
 		parts = append(parts, content.Part{FunctionCall: fc})
 	}
 	return parts

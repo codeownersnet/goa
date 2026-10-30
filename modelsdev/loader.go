@@ -2,6 +2,7 @@ package modelsdev
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,9 @@ import (
 )
 
 const catalogURL = "https://models.dev/api.json"
+
+//go:embed catalog.json
+var embeddedCatalog []byte
 
 type CatalogOption func(*catalogOptions)
 
@@ -46,8 +50,9 @@ func LoadCatalog(ctx context.Context, opts ...CatalogOption) (*Catalog, error) {
 		if o.customURL != "" {
 			url = o.customURL
 		}
-		catalog, err := fetchCatalog(ctx, url, o.httpTimeout)
+		catalog, body, err := fetchCatalog(ctx, url, o.httpTimeout)
 		if err == nil {
+			writeCatalogCache(body)
 			return catalog, nil
 		}
 	}
@@ -59,31 +64,35 @@ func LoadCatalog(ctx context.Context, opts ...CatalogOption) (*Catalog, error) {
 	return embedded, nil
 }
 
-func fetchCatalog(ctx context.Context, url string, timeout time.Duration) (*Catalog, error) {
+func fetchCatalog(ctx context.Context, url string, timeout time.Duration) (*Catalog, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, nil, fmt.Errorf("create request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch catalog: %w", err)
+		return nil, nil, fmt.Errorf("fetch catalog: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch catalog: HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("fetch catalog: HTTP %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read catalog response: %w", err)
+		return nil, nil, fmt.Errorf("read catalog response: %w", err)
 	}
 
-	return ParseCatalog(data)
+	catalog, err := ParseCatalog(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return catalog, data, nil
 }
 
 func ParseCatalog(data []byte) (*Catalog, error) {
@@ -111,23 +120,34 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 }
 
 func loadEmbeddedFallback() (*Catalog, error) {
-	paths := []string{
-		"catalog.json",
-		filepath.Join(os.Getenv("HOME"), ".goa", "catalog.json"),
+	if home, err := os.UserHomeDir(); err == nil {
+		data, err := os.ReadFile(filepath.Join(home, ".goa", "catalog.json"))
+		if err == nil {
+			return ParseCatalog(data)
+		}
 	}
 
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		return ParseCatalog(data)
+	if len(embeddedCatalog) > 0 {
+		return ParseCatalog(embeddedCatalog)
 	}
 
 	return nil, fmt.Errorf("no embedded catalog found")
 }
 
-//go:generate go run ./../cmd/embed-catalog/main.go
+func writeCatalogCache(body []byte) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".goa")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "catalog.json")
+	_ = os.WriteFile(path, body, 0o644)
+}
+
+//go:generate go run ./../cmd/embed-catalog
 
 // YAML parsing helper for SKILL.md integration
 func ParseYAML(data []byte, out any) error {

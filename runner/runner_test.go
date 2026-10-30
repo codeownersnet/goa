@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,8 +91,175 @@ func TestRunnerPassesAgentInstructionToModel(t *testing.T) {
 	assert.Equal(t, "done", events[0].Text())
 }
 
+func TestRunnerConcurrentAutoCreateSessionRace(t *testing.T) {
+	ctx := context.Background()
+	a, err := llmagent.New(llmagent.Config{
+		Name:  "test-agent",
+		Model: &staticModel{},
+	})
+	require.NoError(t, err)
+
+	r, err := New(Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    session.InMemoryService(),
+		ArtifactService:   artifact.InMemoryService(),
+		MemoryService:     memory.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	counts := make(chan int, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			count := 0
+			for ev, runErr := range r.Run(ctx, "user", "shared-session", content.NewTextContent("hi", content.RoleUser), agent.RunConfig{}) {
+				if runErr != nil {
+					errs <- runErr
+					return
+				}
+				if ev != nil {
+					count++
+				}
+			}
+			counts <- count
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(counts)
+
+	var runErrs []error
+	for runErr := range errs {
+		assert.NotContains(t, runErr.Error(), "already exists")
+		runErrs = append(runErrs, runErr)
+	}
+	require.Empty(t, runErrs)
+
+	total := 0
+	for count := range counts {
+		assert.GreaterOrEqual(t, count, 1)
+		total++
+	}
+	assert.Equal(t, goroutines, total)
+}
+
+func TestRunnerStopsAfterMidStreamError(t *testing.T) {
+	ctx := context.Background()
+	boom := fmt.Errorf("model exploded")
+	fm := &scriptedModel{
+		steps: []scriptedStep{
+			{resp: &model.ModelResponse{Content: content.NewTextContent("first", content.RoleModel)}},
+			{err: boom},
+			{resp: &model.ModelResponse{Content: content.NewTextContent("unreachable", content.RoleModel)}},
+		},
+	}
+
+	a, err := llmagent.New(llmagent.Config{
+		Name:  "test-agent",
+		Model: fm,
+	})
+	require.NoError(t, err)
+
+	r, err := New(Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    session.InMemoryService(),
+		ArtifactService:   artifact.InMemoryService(),
+		MemoryService:     memory.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+
+	var events []*session.Event
+	var runErrs []error
+	for ev, runErr := range r.Run(ctx, "user", "session", content.NewTextContent("do it", content.RoleUser), agent.RunConfig{}) {
+		if runErr != nil {
+			runErrs = append(runErrs, runErr)
+			continue
+		}
+		events = append(events, ev)
+	}
+
+	require.Len(t, events, 1)
+	assert.Equal(t, "first", events[0].Text())
+	require.Len(t, runErrs, 1)
+	assert.ErrorIs(t, runErrs[0], boom)
+	assert.Equal(t, 2, fm.yields)
+}
+
+func TestRunnerAutoCreateDisabledMissingSession(t *testing.T) {
+	ctx := context.Background()
+	a, err := llmagent.New(llmagent.Config{
+		Name:  "test-agent",
+		Model: &staticModel{},
+	})
+	require.NoError(t, err)
+
+	r, err := New(Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    session.InMemoryService(),
+		ArtifactService:   artifact.InMemoryService(),
+		AutoCreateSession: false,
+	})
+	require.NoError(t, err)
+
+	var runErrs []error
+	for ev, runErr := range r.Run(ctx, "user", "missing-session", content.NewTextContent("hi", content.RoleUser), agent.RunConfig{}) {
+		assert.Nil(t, ev)
+		runErrs = append(runErrs, runErr)
+	}
+
+	require.Len(t, runErrs, 1)
+	assert.ErrorContains(t, runErrs[0], "get session")
+	assert.ErrorIs(t, runErrs[0], session.ErrNotFound)
+}
+
 type recordArgs struct {
 	Value string `json:"value"`
+}
+
+type staticModel struct{}
+
+func (m *staticModel) Name() string { return "fake" }
+
+func (m *staticModel) Capabilities() model.ModelCapabilities { return model.ModelCapabilities{} }
+
+func (m *staticModel) GenerateContent(_ context.Context, _ *model.ModelRequest, _ bool) iter.Seq2[*model.ModelResponse, error] {
+	return func(yield func(*model.ModelResponse, error) bool) {
+		yield(&model.ModelResponse{Content: content.NewTextContent("ok", content.RoleModel)}, nil)
+	}
+}
+
+type scriptedStep struct {
+	resp *model.ModelResponse
+	err  error
+}
+
+type scriptedModel struct {
+	steps  []scriptedStep
+	yields int
+}
+
+func (m *scriptedModel) Name() string { return "fake" }
+
+func (m *scriptedModel) Capabilities() model.ModelCapabilities { return model.ModelCapabilities{} }
+
+func (m *scriptedModel) GenerateContent(_ context.Context, _ *model.ModelRequest, _ bool) iter.Seq2[*model.ModelResponse, error] {
+	return func(yield func(*model.ModelResponse, error) bool) {
+		for _, step := range m.steps {
+			m.yields++
+			if !yield(step.resp, step.err) {
+				return
+			}
+		}
+	}
 }
 
 type statefulToolModel struct {

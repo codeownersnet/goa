@@ -5,3 +5,4 @@ coverage.out
 .opencode/
 .goa/state/
 .goa/output/
+.DS_Store

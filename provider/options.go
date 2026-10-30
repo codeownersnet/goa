@@ -1,10 +1,13 @@
 package provider
 
+import "github.com/codeownersnet/goa/model"
+
 type ProviderOption func(*providerOptions)
 
 type providerOptions struct {
-	APIKey  string
-	APIBase string
+	APIKey       string
+	APIBase      string
+	Capabilities *model.ModelCapabilities
 }
 
 func WithAPIKey(key string) ProviderOption {
@@ -13,6 +16,10 @@ func WithAPIKey(key string) ProviderOption {
 
 func WithAPIBase(url string) ProviderOption {
 	return func(o *providerOptions) { o.APIBase = url }
+}
+
+func WithCapabilities(c model.ModelCapabilities) ProviderOption {
+	return func(o *providerOptions) { o.Capabilities = &c }
 }
 
 func ApplyOptions(opts ...ProviderOption) *providerOptions {

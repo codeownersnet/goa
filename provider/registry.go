@@ -159,6 +159,12 @@ func (r *Registry) Resolve(ctx context.Context, modelString string, opts ...Prov
 		return nil, fmt.Errorf("provider type %q: %w", entry.Provider.Type, ErrNoFactory)
 	}
 
+	if o := ApplyOptions(opts...); o.Capabilities != nil {
+		copied := *entry
+		copied.Capabilities = *o.Capabilities
+		entry = &copied
+	}
+
 	return factory.NewModel(ctx, entry, opts...)
 }
 

@@ -255,6 +255,7 @@ type chatCompletionRequest struct {
 	Model          string          `json:"model"`
 	Messages       []openaiMessage `json:"messages"`
 	Stream         bool            `json:"stream"`
+	StreamOptions  *streamOptions  `json:"stream_options,omitempty"`
 	Temperature    *float64        `json:"temperature,omitempty"`
 	TopP           *float64        `json:"top_p,omitempty"`
 	MaxTokens      int             `json:"max_tokens,omitempty"`
@@ -262,6 +263,10 @@ type chatCompletionRequest struct {
 	Tools          []openaiTool    `json:"tools,omitempty"`
 	ToolChoice     any             `json:"tool_choice,omitempty"`
 	ResponseFormat any             `json:"response_format,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openaiMessage struct {
@@ -338,4 +343,5 @@ type chatCompletionChunk struct {
 	ID      string                 `json:"id"`
 	Model   string                 `json:"model"`
 	Choices []chatCompletionChoice `json:"choices"`
+	Usage   *openaiUsage           `json:"usage,omitempty"`
 }

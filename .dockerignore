@@ -1,0 +1,6 @@
+.git/
+bin/
+.opencode/
+.goa/state/
+.goa/output/
+coverage.out

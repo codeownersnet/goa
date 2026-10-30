@@ -244,8 +244,8 @@ func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.ModelRequest) ite
 			}
 		}
 
-		caps := f.Model.Capabilities()
-		stream := caps.OutputModalities != nil && caps.OutputModalities["streaming"]
+		rc := ctx.RunConfig()
+		stream := rc != nil && rc.StreamingMode == agent.StreamingModeSSE
 
 		for resp, err := range f.Model.GenerateContent(ctx, req, stream) {
 			if err != nil {
@@ -302,7 +302,6 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.Mode
 	var fatalErr error
 
 	for i, call := range calls {
-		actionsList[i] = &tool.EventActions{}
 		wg.Add(1)
 		go func(idx int, c *content.FunctionCall) {
 			defer wg.Done()
@@ -371,8 +370,10 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.Mode
 	return event, nil
 }
 
+var ErrToolNotFound = errors.New("tool not found")
+
 func (f *Flow) handleToolError(call *content.FunctionCall, err error) (map[string]any, bool) {
-	if strings.HasSuffix(err.Error(), "not found") && strings.Contains(err.Error(), "tool") {
+	if errors.Is(err, ErrToolNotFound) {
 		var names []string
 		for _, t := range f.Tools {
 			names = append(names, t.Name())
@@ -388,7 +389,7 @@ func (f *Flow) handleToolError(call *content.FunctionCall, err error) (map[strin
 func (f *Flow) executeTool(ctx agent.InvocationContext, call *content.FunctionCall, actions *tool.EventActions) (map[string]any, error) {
 	t := f.resolveTool(call.Name)
 	if t == nil {
-		return nil, fmt.Errorf("tool %q not found", call.Name)
+		return nil, fmt.Errorf("tool %q: %w", call.Name, ErrToolNotFound)
 	}
 
 	timeout := f.ToolTimeout
@@ -404,10 +405,12 @@ func (f *Flow) executeTool(ctx agent.InvocationContext, call *content.FunctionCa
 	args := call.Args
 	for _, cb := range f.BeforeToolCallbacks {
 		r, err := cb(flowCtx, t, args)
-		if r != nil || err != nil {
-			return r, err
+		if err != nil {
+			return nil, err
 		}
-		args = r
+		if r != nil {
+			args = r
+		}
 	}
 
 	processCtx := tool.ContextWithActions(flowCtx, actions)

@@ -36,29 +36,21 @@ type Tool struct {
 	tool.Tool
 }
 
-var shellInvokers = map[string]bool{
-	"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true, "ksh": true, "csh": true, "tcsh": true,
-}
+const maxParseDepth = 8
 
-var shellBuiltins = map[string]bool{
-	"cd": true, "echo": true, "pwd": true, "export": true, "source": true, "set": true,
-	"exit": true, "true": true, "false": true, "test": true, "type": true, "command": true,
-	"readonly": true, "local": true, "return": true, "break": true, "continue": true,
-}
-
-func extractCommands(cmd string) []string {
-	var allCmds []string
-
-	segments := splitShellChain(cmd)
-	for _, segment := range segments {
-		piped := extractPipedCommands(segment)
-		allCmds = append(allCmds, piped...)
+func extractCommands(cmd string) ([]string, error) {
+	allCmds, err := parseCommands(cmd, 0)
+	if err != nil {
+		return nil, err
 	}
+	return dedup(allCmds), nil
+}
 
+func dedup(cmds []string) []string {
 	seen := make(map[string]bool)
 	var unique []string
-	for _, c := range allCmds {
-		if !seen[c] {
+	for _, c := range cmds {
+		if c != "" && !seen[c] {
 			seen[c] = true
 			unique = append(unique, c)
 		}
@@ -66,32 +58,167 @@ func extractCommands(cmd string) []string {
 	return unique
 }
 
-func splitShellChain(cmd string) []string {
-	var segments []string
-	for _, part := range strings.Split(cmd, "&&") {
-		for _, sub := range strings.Split(part, ";") {
-			s := strings.TrimSpace(sub)
-			if s != "" {
-				segments = append(segments, s)
+func parseCommands(s string, depth int) ([]string, error) {
+	if depth > maxParseDepth {
+		return nil, fmt.Errorf("shell construct nesting exceeds depth %d", maxParseDepth)
+	}
+	var cmds []string
+	var cur strings.Builder
+
+	flush := func() {
+		if fields := strings.Fields(cur.String()); len(fields) > 0 {
+			cmds = append(cmds, fields[0])
+		}
+		cur.Reset()
+	}
+
+	inSingle, inDouble := false, false
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			i++
+		case inDouble:
+			switch {
+			case c == '"':
+				inDouble = false
+				i++
+			case c == '\\':
+				i += 2
+			case c == '`':
+				inner, next, err := extractBacktick(s, i)
+				if err != nil {
+					return nil, err
+				}
+				sub, err := parseCommands(inner, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				cmds = append(cmds, sub...)
+				i = next
+			case c == '$' && i+1 < len(s) && s[i+1] == '(':
+				inner, next, err := extractSubstitution(s, i)
+				if err != nil {
+					return nil, err
+				}
+				sub, err := parseCommands(inner, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				cmds = append(cmds, sub...)
+				i = next
+			default:
+				i++
+			}
+		default:
+			switch {
+			case c == '\'':
+				inSingle = true
+				i++
+			case c == '"':
+				inDouble = true
+				i++
+			case c == '\\':
+				i += 2
+			case c == '`':
+				inner, next, err := extractBacktick(s, i)
+				if err != nil {
+					return nil, err
+				}
+				sub, err := parseCommands(inner, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				cmds = append(cmds, sub...)
+				i = next
+			case c == '$' && i+1 < len(s) && s[i+1] == '(':
+				inner, next, err := extractSubstitution(s, i)
+				if err != nil {
+					return nil, err
+				}
+				sub, err := parseCommands(inner, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				cmds = append(cmds, sub...)
+				i = next
+			case c == ';' || c == '\n' || c == '\r':
+				flush()
+				i++
+			case c == '&':
+				flush()
+				if i+1 < len(s) && s[i+1] == '&' {
+					i += 2
+				} else {
+					i++
+				}
+			case c == '|':
+				flush()
+				if i+1 < len(s) && s[i+1] == '|' {
+					i += 2
+				} else {
+					i++
+				}
+			default:
+				cur.WriteByte(c)
+				i++
 			}
 		}
 	}
-	return segments
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unbalanced quote")
+	}
+	flush()
+	return cmds, nil
 }
 
-func extractPipedCommands(cmd string) []string {
-	var commands []string
-	parts := strings.Split(cmd, "|")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			first := strings.SplitN(part, " ", 2)[0]
-			if first != "" {
-				commands = append(commands, first)
+func extractBacktick(s string, i int) (string, int, error) {
+	end := strings.IndexByte(s[i+1:], '`')
+	if end < 0 {
+		return "", 0, fmt.Errorf("unbalanced backtick")
+	}
+	return s[i+1 : i+1+end], i + end + 2, nil
+}
+
+func extractSubstitution(s string, i int) (string, int, error) {
+	depth := 1
+	for j := i + 2; j < len(s); j++ {
+		switch s[j] {
+		case '\'':
+			end := strings.IndexByte(s[j+1:], '\'')
+			if end < 0 {
+				return "", 0, fmt.Errorf("unbalanced quote")
+			}
+			j += end + 1
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[i+2 : j], j + 1, nil
 			}
 		}
 	}
-	return commands
+	return "", 0, fmt.Errorf("unbalanced $() substitution")
+}
+
+func naiveExtractCommands(cmd string) []string {
+	var cmds []string
+	for _, part := range strings.Split(cmd, "&&") {
+		for _, sub := range strings.Split(part, ";") {
+			for _, piped := range strings.Split(sub, "|") {
+				piped = strings.TrimSpace(piped)
+				if fields := strings.Fields(piped); len(fields) > 0 {
+					cmds = append(cmds, fields[0])
+				}
+			}
+		}
+	}
+	return dedup(cmds)
 }
 
 func New(cfg Config) (*Tool, error) {
@@ -103,15 +230,22 @@ func New(cfg Config) (*Tool, error) {
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = 1 << 20
 	}
-	guard := pathguard.New(cfg.AllowedPaths)
+	var guard *pathguard.PathGuard
+	if len(cfg.AllowedPaths) > 0 {
+		guard = pathguard.New(cfg.AllowedPaths)
+	}
 
 	ft, err := functiontool.New(functiontool.Config{
 		Name:        "bash",
-		Description: "Runs a shell command and returns its stdout, stderr, and exit code. Each invocation runs a single command. The command string is executed via sh -c, so pipes, redirects, and shell features work.",
+		Description: "Runs a shell command and returns its stdout, stderr, and exit code. Each invocation runs a single command. The command string is executed via sh -c, so pipes, redirects, and shell features work. The allow/deny command lists and path allowlist are defense-in-depth only and NOT a security sandbox; untrusted agents should run under process or container isolation.",
 	}, func(ctx context.Context, args bashArgs) (map[string]any, error) {
-		allCommands := extractCommands(args.Command)
-		pipedCommands := extractPipedCommands(args.Command)
-		allCommands = append(allCommands, pipedCommands...)
+		allCommands, parseErr := extractCommands(args.Command)
+		if parseErr != nil {
+			if len(cfg.AllowedCommands) > 0 {
+				return nil, fmt.Errorf("bash: unable to parse command safely: %w", parseErr)
+			}
+			allCommands = naiveExtractCommands(args.Command)
+		}
 
 		if len(cfg.DeniedCommands) > 0 {
 			for _, cmd := range allCommands {
@@ -125,9 +259,6 @@ func New(cfg Config) (*Tool, error) {
 
 		if len(cfg.AllowedCommands) > 0 {
 			for _, cmd := range allCommands {
-				if shellInvokers[cmd] || shellBuiltins[cmd] {
-					continue
-				}
 				allowed := false
 				for _, a := range cfg.AllowedCommands {
 					if cmd == a {
@@ -141,12 +272,6 @@ func New(cfg Config) (*Tool, error) {
 			}
 		}
 
-		if guard != nil && args.WorkDir != "" {
-			if err := guard.Check(args.WorkDir); err != nil {
-				return nil, fmt.Errorf("bash: %w", err)
-			}
-		}
-
 		timeout := args.Timeout
 		if timeout <= 0 {
 			timeout = defaultTimeout
@@ -155,6 +280,12 @@ func New(cfg Config) (*Tool, error) {
 		workDir := args.WorkDir
 		if workDir == "" {
 			workDir = cfg.WorkDir
+		}
+
+		if guard != nil && workDir != "" {
+			if err := guard.Check(workDir); err != nil {
+				return nil, fmt.Errorf("bash: %w", err)
+			}
 		}
 
 		cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)

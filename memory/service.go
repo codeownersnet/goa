@@ -23,9 +23,11 @@ type SearchResponse struct {
 }
 
 type Entry struct {
-	ID             string
-	Content        string
-	Author         string
-	Timestamp      time.Time
-	CustomMetadata map[string]any
+	ID             string         `json:"id"`
+	AppName        string         `json:"app_name"`
+	UserID         string         `json:"user_id"`
+	Content        string         `json:"content"`
+	Author         string         `json:"author"`
+	Timestamp      time.Time      `json:"timestamp"`
+	CustomMetadata map[string]any `json:"custom_metadata,omitempty"`
 }
