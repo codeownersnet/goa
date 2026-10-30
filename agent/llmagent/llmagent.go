@@ -21,6 +21,7 @@ type Config struct {
 	Model             model.Model
 	Instruction       string
 	Tools             []tool.Tool
+	Toolsets          []tool.Toolset
 	GenerateConfig    *model.GenerateConfig
 	RequestProcessors []flow.RequestProcessor
 	RequireToolUse    bool
@@ -34,6 +35,7 @@ func New(cfg Config) (*Agent, error) {
 		model:             cfg.Model,
 		instruction:       cfg.Instruction,
 		tools:             cfg.Tools,
+		toolsets:          cfg.Toolsets,
 		generateConfig:    cfg.GenerateConfig,
 		requestProcessors: cfg.RequestProcessors,
 		requireToolUse:    cfg.RequireToolUse,
@@ -58,6 +60,7 @@ type Agent struct {
 	model             model.Model
 	instruction       string
 	tools             []tool.Tool
+	toolsets          []tool.Toolset
 	generateConfig    *model.GenerateConfig
 	requestProcessors []flow.RequestProcessor
 	requireToolUse    bool
@@ -67,6 +70,7 @@ func (a *Agent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error
 	f := &flow.Flow{
 		Model:             a.model,
 		Tools:             a.tools,
+		Toolsets:          a.toolsets,
 		Instruction:       a.instruction,
 		GenerateConfig:    a.generateConfig,
 		RequestProcessors: a.requestProcessors,

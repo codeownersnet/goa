@@ -2,22 +2,36 @@ package mcptoolset
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/codeownersnet/goa/tool"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type Config struct {
-	Name           string
-	Command        *exec.Cmd
-	URL            string
-	Headers        map[string]string
-	Env            []string
-	ConnectTimeout time.Duration
-	ToolTimeout    time.Duration
+	Name                      string
+	Command                   *exec.Cmd
+	URL                       string
+	Headers                   map[string]string
+	Env                       []string
+	ConnectTimeout            time.Duration
+	ToolTimeout               time.Duration
+	HTTPClient                *http.Client
+	ProtocolVersion           string
+	MaxEventSize              int
+	MaxRetries                int
+	DisableStandaloneSSE      bool
+	KeepAlive                 time.Duration
+	KeepAliveFailureThreshold int
+	Transport                 mcp.Transport
+	ElicitationHandler        func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error)
+	ProgressHandler           func(context.Context, *mcp.ProgressNotificationClientRequest)
 }
 
 type Option func(*Config)
@@ -31,6 +45,12 @@ func WithName(name string) Option {
 func WithCommand(cmd *exec.Cmd) Option {
 	return func(c *Config) {
 		c.Command = cmd
+	}
+}
+
+func WithTransport(transport mcp.Transport) Option {
+	return func(c *Config) {
+		c.Transport = transport
 	}
 }
 
@@ -64,14 +84,72 @@ func WithToolTimeout(d time.Duration) Option {
 	}
 }
 
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Config) {
+		c.HTTPClient = client
+	}
+}
+
+func WithProtocolVersion(version string) Option {
+	return func(c *Config) {
+		c.ProtocolVersion = version
+	}
+}
+
+func WithMaxEventSize(size int) Option {
+	return func(c *Config) {
+		c.MaxEventSize = size
+	}
+}
+
+func WithMaxRetries(retries int) Option {
+	return func(c *Config) {
+		c.MaxRetries = retries
+	}
+}
+
+func WithDisableStandaloneSSE(disable bool) Option {
+	return func(c *Config) {
+		c.DisableStandaloneSSE = disable
+	}
+}
+
+func WithKeepAlive(d time.Duration) Option {
+	return func(c *Config) {
+		c.KeepAlive = d
+	}
+}
+
+func WithKeepAliveFailureThreshold(threshold int) Option {
+	return func(c *Config) {
+		c.KeepAliveFailureThreshold = threshold
+	}
+}
+
+func WithElicitationHandler(handler func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error)) Option {
+	return func(c *Config) {
+		c.ElicitationHandler = handler
+	}
+}
+
+func WithProgressHandler(handler func(context.Context, *mcp.ProgressNotificationClientRequest)) Option {
+	return func(c *Config) {
+		c.ProgressHandler = handler
+	}
+}
+
 type Toolset struct {
-	name        string
-	client      *mcp.Client
-	session     *mcp.ClientSession
-	tools       []tool.Tool
-	resources   []tool.ResourceInfo
-	prompts     []tool.PromptInfo
-	toolTimeout time.Duration
+	name              string
+	client            *mcp.Client
+	session           *mcp.ClientSession
+	tools             []tool.Tool
+	resources         []tool.ResourceInfo
+	resourceTemplates []tool.ResourceTemplateInfo
+	prompts           []tool.PromptInfo
+	toolTimeout       time.Duration
+
+	mu        sync.RWMutex
+	refreshMu sync.Mutex
 }
 
 func New(ctx context.Context, opts ...Option) (*Toolset, error) {
@@ -90,79 +168,187 @@ func New(ctx context.Context, opts ...Option) (*Toolset, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
 	defer cancel()
 
+	ts := &Toolset{
+		name:        cfg.Name,
+		toolTimeout: cfg.ToolTimeout,
+	}
+
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "goa",
 		Version: "0.1.0",
 	}, &mcp.ClientOptions{
-		ToolListChangedHandler: func(_ context.Context, _ *mcp.ToolListChangedRequest) {
+		ToolListChangedHandler: func(ctx context.Context, _ *mcp.ToolListChangedRequest) {
+			ts.refreshTools(ctx)
 		},
-		PromptListChangedHandler: func(_ context.Context, _ *mcp.PromptListChangedRequest) {
+		PromptListChangedHandler: func(ctx context.Context, _ *mcp.PromptListChangedRequest) {
+			ts.refreshPrompts(ctx)
 		},
-		ResourceListChangedHandler: func(_ context.Context, _ *mcp.ResourceListChangedRequest) {
+		ResourceListChangedHandler: func(ctx context.Context, _ *mcp.ResourceListChangedRequest) {
+			ts.refreshResources(ctx)
 		},
+		KeepAlive:                   cfg.KeepAlive,
+		KeepAliveFailureThreshold:   cfg.KeepAliveFailureThreshold,
+		ElicitationHandler:          cfg.ElicitationHandler,
+		ProgressNotificationHandler: cfg.ProgressHandler,
 	})
+	ts.client = client
 
-	transport, err := newTransport(&transportConfig{
-		command: cfg.Command,
-		url:     cfg.URL,
-		headers: cfg.Headers,
-		env:     cfg.Env,
-		timeout: cfg.ConnectTimeout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("mcptoolset %q: create transport: %w", cfg.Name, err)
+	transport := cfg.Transport
+	if transport == nil {
+		var err error
+		transport, err = newTransport(&transportConfig{
+			command:              cfg.Command,
+			url:                  cfg.URL,
+			headers:              cfg.Headers,
+			env:                  cfg.Env,
+			httpClient:           cfg.HTTPClient,
+			maxEventSize:         cfg.MaxEventSize,
+			maxRetries:           cfg.MaxRetries,
+			disableStandaloneSSE: cfg.DisableStandaloneSSE,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("mcptoolset %q: create transport: %w", cfg.Name, err)
+		}
 	}
 
-	session, err := client.Connect(connectCtx, transport, nil)
+	var sessionOpts *mcp.ClientSessionOptions
+	if cfg.ProtocolVersion != "" {
+		sessionOpts = &mcp.ClientSessionOptions{ProtocolVersion: cfg.ProtocolVersion}
+	}
+
+	session, err := client.Connect(connectCtx, transport, sessionOpts)
 	if err != nil {
 		return nil, fmt.Errorf("mcptoolset %q: connect: %w", cfg.Name, err)
 	}
 
-	ts := &Toolset{
-		name:        cfg.Name,
-		client:      client,
-		session:     session,
-		toolTimeout: cfg.ToolTimeout,
-	}
+	ts.mu.Lock()
+	ts.session = session
+	ts.mu.Unlock()
 
-	toolTimeoutMs := int(cfg.ToolTimeout.Milliseconds())
-
-	if err := ts.discoverTools(ctx, toolTimeoutMs); err != nil {
+	if err := ts.discoverTools(ctx); err != nil {
 		_ = session.Close()
 		return nil, fmt.Errorf("mcptoolset %q: discover tools: %w", cfg.Name, err)
 	}
 
-	if err := ts.discoverResources(ctx); err != nil {
+	if err := ts.discoverResources(ctx); err != nil && !isMethodNotFound(err) {
+		_ = session.Close()
+		return nil, fmt.Errorf("mcptoolset %q: discover resources: %w", cfg.Name, err)
 	}
 
-	if err := ts.discoverPrompts(ctx); err != nil {
+	if err := ts.discoverResourceTemplates(ctx); err != nil && !isMethodNotFound(err) {
+		_ = session.Close()
+		return nil, fmt.Errorf("mcptoolset %q: discover resource templates: %w", cfg.Name, err)
+	}
+
+	if err := ts.discoverPrompts(ctx); err != nil && !isMethodNotFound(err) {
+		_ = session.Close()
+		return nil, fmt.Errorf("mcptoolset %q: discover prompts: %w", cfg.Name, err)
 	}
 
 	return ts, nil
 }
 
 func (ts *Toolset) Tools() []tool.Tool {
-	return ts.tools
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return append([]tool.Tool(nil), ts.tools...)
 }
 
 func (ts *Toolset) Close() error {
-	if ts.session != nil {
-		return ts.session.Close()
+	session := ts.currentSession()
+	if session != nil {
+		return session.Close()
 	}
 	return nil
 }
 
-func (ts *Toolset) discoverTools(ctx context.Context, toolTimeoutMs int) error {
+func (ts *Toolset) ProtocolVersion() string {
+	session := ts.currentSession()
+	if session == nil {
+		return ""
+	}
+	if res := session.InitializeResult(); res != nil {
+		return res.ProtocolVersion
+	}
+	return ""
+}
+
+func (ts *Toolset) ServerInfo() *mcp.Implementation {
+	session := ts.currentSession()
+	if session == nil {
+		return nil
+	}
+	if res := session.InitializeResult(); res != nil {
+		return res.ServerInfo
+	}
+	return nil
+}
+
+func (ts *Toolset) currentSession() *mcp.ClientSession {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.session
+}
+
+func (ts *Toolset) discoverTools(ctx context.Context) error {
+	session := ts.currentSession()
+	if session == nil {
+		return errNotConnected
+	}
+
 	var tools []tool.Tool
-	for mcpToolDef, err := range ts.session.Tools(ctx, nil) {
+	for mcpToolDef, err := range session.Tools(ctx, nil) {
 		if err != nil {
 			return fmt.Errorf("list tools: %w", err)
 		}
-		t := newMCPTool(ts.name, mcpToolDef, ts.session, toolTimeoutMs)
+		t := newMCPTool(ts.name, mcpToolDef, session, ts.toolTimeout)
 		tools = append(tools, t)
 	}
+
+	ts.mu.Lock()
 	ts.tools = tools
+	ts.mu.Unlock()
 	return nil
 }
+
+func (ts *Toolset) refreshTools(ctx context.Context) {
+	ts.refreshMu.Lock()
+	defer ts.refreshMu.Unlock()
+	ctx, cancel := ts.refreshContext(ctx)
+	defer cancel()
+	_ = ts.discoverTools(ctx)
+}
+
+func (ts *Toolset) refreshResources(ctx context.Context) {
+	ts.refreshMu.Lock()
+	defer ts.refreshMu.Unlock()
+	ctx, cancel := ts.refreshContext(ctx)
+	defer cancel()
+	_ = ts.discoverResources(ctx)
+	_ = ts.discoverResourceTemplates(ctx)
+}
+
+func (ts *Toolset) refreshPrompts(ctx context.Context) {
+	ts.refreshMu.Lock()
+	defer ts.refreshMu.Unlock()
+	ctx, cancel := ts.refreshContext(ctx)
+	defer cancel()
+	_ = ts.discoverPrompts(ctx)
+}
+
+func (ts *Toolset) refreshContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx = context.WithoutCancel(ctx)
+	if ts.toolTimeout > 0 {
+		return context.WithTimeout(ctx, ts.toolTimeout)
+	}
+	return context.WithCancel(ctx)
+}
+
+func isMethodNotFound(err error) bool {
+	var rpcErr *jsonrpc.Error
+	return errors.As(err, &rpcErr) && rpcErr.Code == jsonrpc.CodeMethodNotFound
+}
+
+var errNotConnected = errors.New("mcptoolset: not connected")
 
 var _ tool.Toolset = (*Toolset)(nil)

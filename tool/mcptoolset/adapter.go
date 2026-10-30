@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/codeownersnet/goa/content"
 	"github.com/codeownersnet/goa/schema"
@@ -18,10 +19,10 @@ type mcpTool struct {
 	session     *mcp.ClientSession
 	serverName  string
 	toolName    string
-	timeout     int
+	timeout     time.Duration
 }
 
-func newMCPTool(serverName string, def *mcp.Tool, session *mcp.ClientSession, timeout int) *mcpTool {
+func newMCPTool(serverName string, def *mcp.Tool, session *mcp.ClientSession, timeout time.Duration) *mcpTool {
 	sanitizedServer := sanitizeName(serverName)
 	sanitizedTool := sanitizeName(def.Name)
 	prefixedName := sanitizedServer + "_" + sanitizedTool
@@ -67,6 +68,12 @@ func (t *mcpTool) Description() string {
 }
 
 func (t *mcpTool) Process(ctx context.Context, args map[string]any) (map[string]any, error) {
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.timeout)
+		defer cancel()
+	}
+
 	params := &mcp.CallToolParams{
 		Name:      t.toolName,
 		Arguments: args,

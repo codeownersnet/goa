@@ -241,6 +241,11 @@ func validateMCPServers(servers map[string]mcpServerYAML, basePath string) []err
 				errs = append(errs, &WorkflowError{Field: p + ".tool_timeout", Message: fmt.Sprintf("invalid duration %q", cfg.ToolTimeout), Err: err})
 			}
 		}
+		if cfg.KeepAlive != "" {
+			if _, err := time.ParseDuration(cfg.KeepAlive); err != nil {
+				errs = append(errs, &WorkflowError{Field: p + ".keep_alive", Message: fmt.Sprintf("invalid duration %q", cfg.KeepAlive), Err: err})
+			}
+		}
 		for k := range cfg.Headers {
 			if k == "" {
 				errs = append(errs, &WorkflowError{Field: p + ".headers", Message: "header key must not be empty"})

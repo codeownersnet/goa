@@ -26,12 +26,18 @@ type providerYAML struct {
 }
 
 type mcpServerYAML struct {
-	Command        string            `yaml:"command"`
-	URL            string            `yaml:"url"`
-	Headers        map[string]string `yaml:"headers"`
-	Env            []string          `yaml:"env"`
-	ConnectTimeout string            `yaml:"connect_timeout"`
-	ToolTimeout    string            `yaml:"tool_timeout"`
+	Command                   string            `yaml:"command"`
+	URL                       string            `yaml:"url"`
+	Headers                   map[string]string `yaml:"headers"`
+	Env                       []string          `yaml:"env"`
+	ConnectTimeout            string            `yaml:"connect_timeout"`
+	ToolTimeout               string            `yaml:"tool_timeout"`
+	ProtocolVersion           string            `yaml:"protocol_version"`
+	MaxEventSize              int               `yaml:"max_event_size"`
+	MaxRetries                int               `yaml:"max_retries"`
+	DisableStandaloneSSE      bool              `yaml:"disable_standalone_sse"`
+	KeepAlive                 string            `yaml:"keep_alive"`
+	KeepAliveFailureThreshold int               `yaml:"keep_alive_failure_threshold"`
 }
 
 type stepYAML struct {

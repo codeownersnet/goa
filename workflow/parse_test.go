@@ -134,6 +134,12 @@ mcp_servers:
       Authorization: "Bearer token"
     connect_timeout: 10s
     tool_timeout: 120s
+    protocol_version: "2025-11-25"
+    max_event_size: 4096
+    max_retries: 3
+    disable_standalone_sse: true
+    keep_alive: 30s
+    keep_alive_failure_threshold: 2
 steps:
   - name: step1
     model: synthetic/hf:zai-org/GLM-4.7-Flash
@@ -148,6 +154,12 @@ steps:
 	assert.Equal(t, "Bearer token", raw.MCPServers["remote-api"].Headers["Authorization"])
 	assert.Equal(t, "10s", raw.MCPServers["remote-api"].ConnectTimeout)
 	assert.Equal(t, "120s", raw.MCPServers["remote-api"].ToolTimeout)
+	assert.Equal(t, "2025-11-25", raw.MCPServers["remote-api"].ProtocolVersion)
+	assert.Equal(t, 4096, raw.MCPServers["remote-api"].MaxEventSize)
+	assert.Equal(t, 3, raw.MCPServers["remote-api"].MaxRetries)
+	assert.True(t, raw.MCPServers["remote-api"].DisableStandaloneSSE)
+	assert.Equal(t, "30s", raw.MCPServers["remote-api"].KeepAlive)
+	assert.Equal(t, 2, raw.MCPServers["remote-api"].KeepAliveFailureThreshold)
 }
 
 func TestParseWithoutMCPServers(t *testing.T) {

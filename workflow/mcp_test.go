@@ -41,6 +41,29 @@ func TestMCPServerYAMLOptionsURL(t *testing.T) {
 	assert.Len(t, opts, 3)
 }
 
+func TestMCPServerYAMLOptionsTransport(t *testing.T) {
+	opts, err := mcpServerYAMLOptions("api", mcpServerYAML{
+		URL:                       "https://mcp.example.com/mcp",
+		ProtocolVersion:           "2025-11-25",
+		MaxEventSize:              4096,
+		MaxRetries:                3,
+		DisableStandaloneSSE:      true,
+		KeepAlive:                 "30s",
+		KeepAliveFailureThreshold: 2,
+	})
+	assert.NoError(t, err)
+	assert.Len(t, opts, 8)
+}
+
+func TestMCPServerYAMLOptionsBadKeepAlive(t *testing.T) {
+	_, err := mcpServerYAMLOptions("srv", mcpServerYAML{
+		URL:       "https://example.com",
+		KeepAlive: "not-a-duration",
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "keep_alive")
+}
+
 func TestMCPServerYAMLOptionsBadDuration(t *testing.T) {
 	_, err := mcpServerYAMLOptions("srv", mcpServerYAML{
 		URL:            "https://example.com",

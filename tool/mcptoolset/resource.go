@@ -10,11 +10,24 @@ import (
 )
 
 func (ts *Toolset) Resources() []tool.ResourceInfo {
-	return ts.resources
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return append([]tool.ResourceInfo(nil), ts.resources...)
+}
+
+func (ts *Toolset) ResourceTemplates() []tool.ResourceTemplateInfo {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return append([]tool.ResourceTemplateInfo(nil), ts.resourceTemplates...)
 }
 
 func (ts *Toolset) ReadResource(ctx context.Context, uri string) ([]byte, error) {
-	result, err := ts.session.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+	session := ts.currentSession()
+	if session == nil {
+		return nil, errNotConnected
+	}
+
+	result, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
 	if err != nil {
 		return nil, fmt.Errorf("mcptoolset %q: read resource %q: %w", ts.name, uri, err)
 	}
@@ -41,8 +54,13 @@ func (ts *Toolset) ReadResource(ctx context.Context, uri string) ([]byte, error)
 }
 
 func (ts *Toolset) discoverResources(ctx context.Context) error {
+	session := ts.currentSession()
+	if session == nil {
+		return errNotConnected
+	}
+
 	var resources []tool.ResourceInfo
-	for res, err := range ts.session.Resources(ctx, nil) {
+	for res, err := range session.Resources(ctx, nil) {
 		if err != nil {
 			return fmt.Errorf("list resources: %w", err)
 		}
@@ -53,8 +71,37 @@ func (ts *Toolset) discoverResources(ctx context.Context) error {
 			MimeType:    res.MIMEType,
 		})
 	}
+
+	ts.mu.Lock()
 	ts.resources = resources
+	ts.mu.Unlock()
+	return nil
+}
+
+func (ts *Toolset) discoverResourceTemplates(ctx context.Context) error {
+	session := ts.currentSession()
+	if session == nil {
+		return errNotConnected
+	}
+
+	var templates []tool.ResourceTemplateInfo
+	for tpl, err := range session.ResourceTemplates(ctx, nil) {
+		if err != nil {
+			return fmt.Errorf("list resource templates: %w", err)
+		}
+		templates = append(templates, tool.ResourceTemplateInfo{
+			Name:        tpl.Name,
+			URITemplate: tpl.URITemplate,
+			Description: tpl.Description,
+			MimeType:    tpl.MIMEType,
+		})
+	}
+
+	ts.mu.Lock()
+	ts.resourceTemplates = templates
+	ts.mu.Unlock()
 	return nil
 }
 
 var _ tool.ResourceProvider = (*Toolset)(nil)
+var _ tool.ResourceTemplateProvider = (*Toolset)(nil)

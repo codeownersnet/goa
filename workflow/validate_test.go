@@ -92,7 +92,7 @@ func TestValidateInvalidTimeout(t *testing.T) {
 	raw := &workflowYAML{
 		Name: "test", Description: "desc",
 		ExitWhen: &exitWhenYAML{Timeout: "not-a-duration"},
-		Steps: []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
+		Steps:    []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
 	}
 	err := validate(raw)
 	assert.Error(t, err)
@@ -126,7 +126,7 @@ func TestValidateValidLoopWithExitWhen(t *testing.T) {
 	raw := &workflowYAML{
 		Name: "test", Description: "desc", Type: wfTypeLoop, MaxIterations: 5,
 		ExitWhen: &exitWhenYAML{State: map[string]string{"done": "true"}, Timeout: "5m"},
-		Steps: []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
+		Steps:    []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
 	}
 	err := validate(raw)
 	assert.NoError(t, err)
@@ -146,7 +146,7 @@ func TestValidateMCPServersValid(t *testing.T) {
 	raw := &workflowYAML{
 		Name: "test", Description: "desc",
 		MCPServers: map[string]mcpServerYAML{
-			"fs": {Command: "npx -y @mcp/server-filesystem /tmp"},
+			"fs":  {Command: "npx -y @mcp/server-filesystem /tmp"},
 			"api": {URL: "https://mcp.example.com/sse", Headers: map[string]string{"Auth": "Bearer x"}, ConnectTimeout: "10s", ToolTimeout: "120s"},
 		},
 		Steps: []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
@@ -218,6 +218,19 @@ func TestValidateMCPServersBadToolTimeout(t *testing.T) {
 	err := validate(raw)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_timeout")
+}
+
+func TestValidateMCPServersBadKeepAlive(t *testing.T) {
+	raw := &workflowYAML{
+		Name: "test", Description: "desc",
+		MCPServers: map[string]mcpServerYAML{
+			"srv": {URL: "https://example.com", KeepAlive: "bad"},
+		},
+		Steps: []stepYAML{{Name: "s1", Type: stepTypeLLM, Model: "m", Instruction: "i"}},
+	}
+	err := validate(raw)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "keep_alive")
 }
 
 func TestValidateProvidersValid(t *testing.T) {

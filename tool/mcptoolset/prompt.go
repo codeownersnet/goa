@@ -10,11 +10,18 @@ import (
 )
 
 func (ts *Toolset) Prompts() []tool.PromptInfo {
-	return ts.prompts
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return append([]tool.PromptInfo(nil), ts.prompts...)
 }
 
 func (ts *Toolset) GetPrompt(ctx context.Context, name string, args map[string]string) (string, error) {
-	result, err := ts.session.GetPrompt(ctx, &mcp.GetPromptParams{
+	session := ts.currentSession()
+	if session == nil {
+		return "", errNotConnected
+	}
+
+	result, err := session.GetPrompt(ctx, &mcp.GetPromptParams{
 		Name:      name,
 		Arguments: args,
 	})
@@ -33,8 +40,13 @@ func (ts *Toolset) GetPrompt(ctx context.Context, name string, args map[string]s
 }
 
 func (ts *Toolset) discoverPrompts(ctx context.Context) error {
+	session := ts.currentSession()
+	if session == nil {
+		return errNotConnected
+	}
+
 	var prompts []tool.PromptInfo
-	for p, err := range ts.session.Prompts(ctx, nil) {
+	for p, err := range session.Prompts(ctx, nil) {
 		if err != nil {
 			return fmt.Errorf("list prompts: %w", err)
 		}
@@ -51,7 +63,10 @@ func (ts *Toolset) discoverPrompts(ctx context.Context) error {
 		}
 		prompts = append(prompts, pi)
 	}
+
+	ts.mu.Lock()
 	ts.prompts = prompts
+	ts.mu.Unlock()
 	return nil
 }
 

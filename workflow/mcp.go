@@ -112,5 +112,27 @@ func mcpServerYAMLOptions(name string, cfg mcpServerYAML) ([]mcptoolset.Option, 
 		}
 		opts = append(opts, mcptoolset.WithToolTimeout(d))
 	}
+	if cfg.ProtocolVersion != "" {
+		opts = append(opts, mcptoolset.WithProtocolVersion(cfg.ProtocolVersion))
+	}
+	if cfg.MaxEventSize != 0 {
+		opts = append(opts, mcptoolset.WithMaxEventSize(cfg.MaxEventSize))
+	}
+	if cfg.MaxRetries != 0 {
+		opts = append(opts, mcptoolset.WithMaxRetries(cfg.MaxRetries))
+	}
+	if cfg.DisableStandaloneSSE {
+		opts = append(opts, mcptoolset.WithDisableStandaloneSSE(true))
+	}
+	if cfg.KeepAlive != "" {
+		d, err := time.ParseDuration(cfg.KeepAlive)
+		if err != nil {
+			return nil, fmt.Errorf("parse keep_alive: %w", err)
+		}
+		opts = append(opts, mcptoolset.WithKeepAlive(d))
+	}
+	if cfg.KeepAliveFailureThreshold != 0 {
+		opts = append(opts, mcptoolset.WithKeepAliveFailureThreshold(cfg.KeepAliveFailureThreshold))
+	}
 	return opts, nil
 }

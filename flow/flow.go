@@ -35,6 +35,7 @@ type RequestProcessor func(agent.InvocationContext, *model.ModelRequest, *Flow) 
 type Flow struct {
 	Model                 model.Model
 	Tools                 []tool.Tool
+	Toolsets              []tool.Toolset
 	Instruction           string
 	GenerateConfig        *model.GenerateConfig
 	MaxIterations         int
@@ -375,7 +376,7 @@ var ErrToolNotFound = errors.New("tool not found")
 func (f *Flow) handleToolError(call *content.FunctionCall, err error) (map[string]any, bool) {
 	if errors.Is(err, ErrToolNotFound) {
 		var names []string
-		for _, t := range f.Tools {
+		for _, t := range f.allTools() {
 			names = append(names, t.Name())
 		}
 		return map[string]any{
@@ -441,13 +442,42 @@ func (f *Flow) executeTool(ctx agent.InvocationContext, call *content.FunctionCa
 
 func (f *Flow) resolveTool(name string) tool.Tool {
 	lower := strings.ToLower(name)
-	for _, t := range f.Tools {
+	for _, t := range f.allTools() {
 		toolName := t.Name()
 		if toolName == name || strings.ToLower(toolName) == lower {
 			return t
 		}
 	}
 	return nil
+}
+
+func (f *Flow) allTools() []tool.Tool {
+	if len(f.Toolsets) == 0 {
+		return f.Tools
+	}
+
+	tools := make([]tool.Tool, 0, len(f.Tools))
+	seen := make(map[string]bool, len(f.Tools))
+	for _, t := range f.Tools {
+		if seen[t.Name()] {
+			continue
+		}
+		seen[t.Name()] = true
+		tools = append(tools, t)
+	}
+	for _, ts := range f.Toolsets {
+		if ts == nil {
+			continue
+		}
+		for _, t := range ts.Tools() {
+			if seen[t.Name()] {
+				continue
+			}
+			seen[t.Name()] = true
+			tools = append(tools, t)
+		}
+	}
+	return tools
 }
 
 type doomLoopDetector struct {
@@ -556,7 +586,7 @@ func (f *Flow) buildEvent(ctx agent.InvocationContext, resp *model.ModelResponse
 
 func (f *Flow) buildToolDeclarations() map[string]any {
 	declarations := make(map[string]any)
-	for _, t := range f.Tools {
+	for _, t := range f.allTools() {
 		if d, ok := t.(tool.Declarer); ok {
 			declarations[t.Name()] = *d.Declaration()
 		} else {
