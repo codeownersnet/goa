@@ -165,6 +165,7 @@ func resolveLLMStep(ctx context.Context, s stepYAML, cfg resolverConfig, path st
 	}
 
 	var tools []tool.Tool
+	var toolsets []tool.Toolset
 	for _, toolName := range s.Tools {
 		if isMCPWildcard(toolName) {
 			serverName := mcpServerName(toolName)
@@ -181,7 +182,7 @@ func resolveLLMStep(ctx context.Context, s stepYAML, cfg resolverConfig, path st
 					Message: fmt.Sprintf("mcp server %q not declared in mcp_servers", serverName),
 				}
 			}
-			tools = append(tools, ts.Tools()...)
+			toolsets = append(toolsets, ts)
 			continue
 		}
 
@@ -258,6 +259,7 @@ func resolveLLMStep(ctx context.Context, s stepYAML, cfg resolverConfig, path st
 		Model:          mdl,
 		Instruction:    instruction,
 		Tools:          tools,
+		Toolsets:       toolsets,
 		GenerateConfig: genCfg,
 		RequireToolUse: noQuestions,
 	})

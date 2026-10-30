@@ -375,3 +375,35 @@ func (m *unknownToolModel) GenerateContent(_ context.Context, _ *model.ModelRequ
 		}, nil)
 	}
 }
+
+type staticTool struct {
+	name string
+}
+
+func (t staticTool) Name() string        { return t.name }
+func (t staticTool) Description() string { return t.name }
+
+func (t staticTool) Process(context.Context, map[string]any) (map[string]any, error) {
+	return nil, nil
+}
+
+type staticToolset []tool.Tool
+
+func (s staticToolset) Tools() []tool.Tool { return s }
+
+func TestAllToolsMergesToolsets(t *testing.T) {
+	f := &Flow{
+		Tools: []tool.Tool{staticTool{name: "shared"}, staticTool{name: "static"}},
+		Toolsets: []tool.Toolset{
+			staticToolset{staticTool{name: "shared"}, staticTool{name: "dynamic"}},
+			nil,
+		},
+	}
+
+	names := make([]string, 0)
+	for _, tl := range f.allTools() {
+		names = append(names, tl.Name())
+	}
+	assert.Equal(t, []string{"shared", "static", "dynamic"}, names)
+	assert.Contains(t, f.buildToolDeclarations(), "dynamic")
+}

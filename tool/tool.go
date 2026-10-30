@@ -34,6 +34,17 @@ type ResourceProvider interface {
 	ReadResource(ctx context.Context, uri string) ([]byte, error)
 }
 
+type ResourceTemplateInfo struct {
+	Name        string `json:"name"`
+	URITemplate string `json:"uriTemplate"`
+	Description string `json:"description,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+}
+
+type ResourceTemplateProvider interface {
+	ResourceTemplates() []ResourceTemplateInfo
+}
+
 type PromptArgument struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
@@ -49,6 +60,31 @@ type PromptInfo struct {
 type PromptProvider interface {
 	Prompts() []PromptInfo
 	GetPrompt(ctx context.Context, name string, args map[string]string) (string, error)
+}
+
+// CompletionReference identifies a prompt or resource for argument completion.
+// Type must be "ref/prompt" or "ref/resource".
+type CompletionReference struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
+	URI  string `json:"uri,omitempty"`
+}
+
+type CompletionRequest struct {
+	Ref       CompletionReference `json:"ref"`
+	Argument  string              `json:"argument"`
+	Value     string              `json:"value"`
+	Arguments map[string]string   `json:"arguments,omitempty"`
+}
+
+type CompletionResult struct {
+	Values  []string `json:"values"`
+	Total   int      `json:"total,omitempty"`
+	HasMore bool     `json:"hasMore,omitempty"`
+}
+
+type CompletionProvider interface {
+	Complete(ctx context.Context, req CompletionRequest) (CompletionResult, error)
 }
 
 type Context interface {
