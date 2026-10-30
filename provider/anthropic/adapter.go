@@ -3,8 +3,8 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"net/http"
 	"strings"
@@ -17,13 +17,22 @@ import (
 )
 
 type Config struct {
-	BaseURL          string
-	APIKey           string
-	ProviderModelID  string
-	MaxRetries       int
-	InitialRetryWait time.Duration
-	MaxRetryWait     time.Duration
-	HTTPClient       *http.Client
+	BaseURL            string
+	APIKey             string
+	ProviderModelID    string
+	MaxRetries         int
+	SingleAttempt      bool
+	MaxStreamBytes     int
+	MaxStreamToolCalls int
+	MaxResponseBytes   int
+	MaxErrorBodyBytes  int
+	StreamIdleTimeout  time.Duration
+	DisableRedirects   bool
+	CheckRedirect      func(*http.Request, []*http.Request) error
+	BeforeAttempt      func(context.Context, int) error
+	InitialRetryWait   time.Duration
+	MaxRetryWait       time.Duration
+	HTTPClient         *http.Client
 }
 
 type Adapter struct {
@@ -33,10 +42,7 @@ type Adapter struct {
 }
 
 func New(cfg Config) *Adapter {
-	client := cfg.HTTPClient
-	if client == nil {
-		client = &http.Client{}
-	}
+	client := internal.NewHTTPClient(cfg.HTTPClient, cfg.DisableRedirects, cfg.CheckRedirect)
 	return &Adapter{
 		cfg:    cfg,
 		client: client,
@@ -74,9 +80,12 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 		return nil, fmt.Errorf("build anthropic request: %w", err)
 	}
 
-	maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
+	maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.SingleAttempt, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := a.beforeAttempt(ctx, attempt); err != nil {
+			return nil, err
+		}
 		if err := internal.WaitBeforeRetry(ctx, attempt, initialWait, maxWait); err != nil {
 			return nil, err
 		}
@@ -88,6 +97,10 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
+			var redirectErr *internal.RedirectError
+			if errors.As(err, &redirectErr) {
+				return nil, fmt.Errorf("call anthropic api: %w", err)
+			}
 			if attempt < maxRetries {
 				continue
 			}
@@ -96,7 +109,8 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 
 		if resp.StatusCode == http.StatusOK {
 			var msgResp messagesResponse
-			if err := internal.DecodeJSON(resp.Body, &msgResp); err != nil {
+			maxResponseBytes := internal.StreamLimit(a.cfg.MaxResponseBytes, internal.DefaultMaxResponseBytes)
+			if err := internal.DecodeJSONLimited(resp.Body, &msgResp, maxResponseBytes); err != nil {
 				resp.Body.Close()
 				return nil, fmt.Errorf("decode anthropic response: %w", err)
 			}
@@ -105,11 +119,11 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 		}
 
 		statusCode := resp.StatusCode
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		info := internal.ReadErrorInfo(resp.Body, internal.StreamLimit(a.cfg.MaxErrorBodyBytes, internal.DefaultMaxErrorBodyBytes))
 		resp.Body.Close()
 
 		if !internal.IsRetryableStatus(statusCode) {
-			return nil, fmt.Errorf("anthropic api returned HTTP %d: %s", statusCode, errBody)
+			return nil, a.providerError(resp, statusCode, info.Code)
 		}
 
 		if after := internal.RetryAfter(resp); after > 0 {
@@ -130,7 +144,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 
 		body.Stream = true
 
-		maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
+		maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.SingleAttempt, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
 		resp, err := a.openStream(ctx, body, maxRetries, initialWait, maxWait)
 		if err != nil {
 			yield(nil, err)
@@ -143,20 +157,40 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		var textContent strings.Builder
 		acc := newAnthropicToolCallAccumulator()
 		var usage *model.Usage
-		var finishReason model.FinishReason
+		finishReason := model.FinishReasonStop
+		maxStreamBytes := internal.StreamLimit(a.cfg.MaxStreamBytes, internal.DefaultMaxStreamBytes)
+		maxToolCalls := internal.StreamLimit(a.cfg.MaxStreamToolCalls, internal.DefaultMaxStreamToolCalls)
+		streamBytes := 0
+		emitted := false
+		sawMessageStop := false
+		sawStopReason := false
 
 		for scanner.Next() {
 			event := scanner.Event()
+			streamBytes += len(event.Data)
+			if streamBytes > maxStreamBytes {
+				yield(nil, newAnthropicStreamError(model.StreamErrorLimit, emitted, fmt.Errorf("stream exceeded %d bytes", maxStreamBytes)))
+				return
+			}
+
+			if strings.TrimSpace(event.Data) == "" {
+				continue
+			}
 
 			var sseEvent anthropicSSE
 			if err := internal.DecodeJSONString(event.Data, &sseEvent); err != nil {
-				continue
+				yield(nil, newAnthropicStreamError(model.StreamErrorMalformed, emitted, fmt.Errorf("decode stream event: %w", err)))
+				return
 			}
 
 			switch sseEvent.Type {
 			case "content_block_start":
 				if sseEvent.ContentBlock != nil && sseEvent.ContentBlock.Type == "tool_use" {
 					acc.start(sseEvent.Index, sseEvent.ContentBlock.ID, sseEvent.ContentBlock.Name)
+					if acc.count() > maxToolCalls {
+						yield(nil, newAnthropicStreamError(model.StreamErrorLimit, emitted, fmt.Errorf("stream exceeded %d tool calls", maxToolCalls)))
+						return
+					}
 				}
 
 			case "content_block_delta":
@@ -171,6 +205,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 						if !yield(partialResp, nil) {
 							return
 						}
+						emitted = true
 					case "thinking_delta":
 						thinkingText.WriteString(sseEvent.Delta.Thinking)
 						partialResp := &model.ModelResponse{
@@ -180,6 +215,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 						if !yield(partialResp, nil) {
 							return
 						}
+						emitted = true
 					case "input_json_delta":
 						acc.feedDelta(sseEvent.Index, sseEvent.Delta.PartialJSON)
 					}
@@ -197,7 +233,11 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 				}
 				if sseEvent.Delta != nil && sseEvent.Delta.StopReason != "" {
 					finishReason = fromAnthropicStopReason(sseEvent.Delta.StopReason)
+					sawStopReason = true
 				}
+
+			case "message_stop":
+				sawMessageStop = true
 
 			case "message_start":
 				if sseEvent.Message != nil && sseEvent.Message.Usage != nil {
@@ -207,11 +247,19 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		}
 
 		if err := scanner.Err(); err != nil {
-			yield(nil, fmt.Errorf("scan sse stream: %w", err))
+			yield(nil, newAnthropicStreamError(model.StreamErrorIncomplete, emitted, fmt.Errorf("scan sse stream: %w", err)))
+			return
+		}
+		if !sawMessageStop && !sawStopReason {
+			yield(nil, newAnthropicStreamError(model.StreamErrorIncomplete, emitted, fmt.Errorf("stream ended without message_stop or stop reason")))
 			return
 		}
 
-		toolCallParts := acc.parts()
+		toolCallParts, err := acc.parts()
+		if err != nil {
+			yield(nil, newAnthropicStreamError(model.StreamErrorInvalidToolCall, emitted, err))
+			return
+		}
 
 		var allParts []content.Part
 		if thinkingText.Len() > 0 {
@@ -233,8 +281,33 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 	}
 }
 
+func (a *Adapter) beforeAttempt(ctx context.Context, attempt int) error {
+	if a.cfg.BeforeAttempt != nil {
+		return a.cfg.BeforeAttempt(ctx, attempt)
+	}
+	return nil
+}
+
+func (a *Adapter) providerError(resp *http.Response, statusCode int, code string) error {
+	return &model.ProviderError{
+		Provider:   "anthropic",
+		StatusCode: statusCode,
+		Code:       code,
+		Retryable:  internal.IsRetryableStatus(statusCode),
+		RetryAfter: internal.RetryAfter(resp),
+		RequestID:  internal.ProviderRequestID(resp.Header),
+	}
+}
+
+func newAnthropicStreamError(kind model.StreamErrorKind, interrupted bool, err error) error {
+	return fmt.Errorf("anthropic stream: %w", &model.StreamError{Kind: kind, Interrupted: interrupted, Err: err})
+}
+
 func (a *Adapter) openStream(ctx context.Context, body *messagesRequest, maxRetries int, initialWait, maxWait time.Duration) (*http.Response, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := a.beforeAttempt(ctx, attempt); err != nil {
+			return nil, err
+		}
 		if err := internal.WaitBeforeRetry(ctx, attempt, initialWait, maxWait); err != nil {
 			return nil, err
 		}
@@ -246,6 +319,10 @@ func (a *Adapter) openStream(ctx context.Context, body *messagesRequest, maxRetr
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
+			var redirectErr *internal.RedirectError
+			if errors.As(err, &redirectErr) {
+				return nil, fmt.Errorf("call anthropic streaming api: %w", err)
+			}
 			if attempt < maxRetries {
 				continue
 			}
@@ -253,6 +330,9 @@ func (a *Adapter) openStream(ctx context.Context, body *messagesRequest, maxRetr
 		}
 
 		if resp.StatusCode == http.StatusOK {
+			if a.cfg.StreamIdleTimeout > 0 {
+				resp.Body = internal.NewIdleTimeoutReader(resp.Body, a.cfg.StreamIdleTimeout)
+			}
 			return resp, nil
 		}
 
@@ -260,11 +340,11 @@ func (a *Adapter) openStream(ctx context.Context, body *messagesRequest, maxRetr
 		if after := internal.RetryAfter(resp); after > 0 {
 			initialWait = after
 		}
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		info := internal.ReadErrorInfo(resp.Body, internal.StreamLimit(a.cfg.MaxErrorBodyBytes, internal.DefaultMaxErrorBodyBytes))
 		resp.Body.Close()
 
 		if !internal.IsRetryableStatus(statusCode) {
-			return nil, fmt.Errorf("anthropic streaming api returned HTTP %d: %s", statusCode, errBody)
+			return nil, a.providerError(resp, statusCode, info.Code)
 		}
 	}
 
@@ -278,6 +358,7 @@ type anthropicToolCallAccumulator struct {
 	calls    map[int]*content.FunctionCall
 	argsBufs map[int]*strings.Builder
 	finals   map[int]content.Part
+	err      error
 }
 
 func newAnthropicToolCallAccumulator() *anthropicToolCallAccumulator {
@@ -304,32 +385,69 @@ func (a *anthropicToolCallAccumulator) feedDelta(index int, partialJSON string) 
 	a.argsBufs[index].WriteString(partialJSON)
 }
 
+func (a *anthropicToolCallAccumulator) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.calls)
+}
+
 func (a *anthropicToolCallAccumulator) finalize(index int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if _, ok := a.finals[index]; ok {
+		return
+	}
 	fc, ok := a.calls[index]
 	if !ok {
 		return
 	}
-	args := make(map[string]any)
-	if builder := a.argsBufs[index]; builder != nil && builder.Len() > 0 {
-		buf := builder.String()
-		if err := json.Unmarshal([]byte(buf), &args); err != nil {
-			args = map[string]any{"raw": buf}
-		}
+	if fc.ID == "" {
+		a.err = fmt.Errorf("tool call %d is missing an id", index)
+		return
+	}
+	if fc.Name == "" {
+		a.err = fmt.Errorf("tool call %d is missing a name", index)
+		return
+	}
+	args, err := parseAnthropicArgs(a.argsBufs[index].String())
+	if err != nil {
+		a.err = fmt.Errorf("tool call %q has invalid arguments: %w", fc.Name, err)
+		return
 	}
 	fc.Args = args
 	a.finals[index] = content.Part{FunctionCall: fc}
 }
 
-func (a *anthropicToolCallAccumulator) parts() []content.Part {
+func (a *anthropicToolCallAccumulator) parts() ([]content.Part, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.err != nil {
+		return nil, a.err
+	}
+	for index := range a.calls {
+		if _, ok := a.finals[index]; !ok {
+			return nil, fmt.Errorf("tool call %d was not completed", index)
+		}
+	}
 	var result []content.Part
 	for i := 0; i < len(a.finals); i++ {
 		if p, ok := a.finals[i]; ok {
 			result = append(result, p)
 		}
 	}
-	return result
+	return result, nil
+}
+
+func parseAnthropicArgs(s string) (map[string]any, error) {
+	if strings.TrimSpace(s) == "" {
+		return make(map[string]any), nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(s), &args); err != nil {
+		return nil, err
+	}
+	if args == nil {
+		args = make(map[string]any)
+	}
+	return args, nil
 }

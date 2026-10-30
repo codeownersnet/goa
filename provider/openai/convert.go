@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/codeownersnet/goa/content"
 	"github.com/codeownersnet/goa/model"
@@ -244,11 +245,25 @@ func (a *Adapter) newHTTPRequest(ctx context.Context, method, path string, body 
 }
 
 func parseArgsJSON(s string) map[string]any {
-	var args map[string]any
-	if err := json.Unmarshal([]byte(s), &args); err != nil {
+	args, err := parseArgsJSONStrict(s)
+	if err != nil {
 		return map[string]any{"raw": s}
 	}
 	return args
+}
+
+func parseArgsJSONStrict(s string) (map[string]any, error) {
+	if strings.TrimSpace(s) == "" {
+		return make(map[string]any), nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(s), &args); err != nil {
+		return nil, err
+	}
+	if args == nil {
+		args = make(map[string]any)
+	}
+	return args, nil
 }
 
 type chatCompletionRequest struct {

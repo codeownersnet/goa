@@ -26,6 +26,7 @@ import (
 	"github.com/codeownersnet/goa/tool/listdir"
 	"github.com/codeownersnet/goa/tool/plantool"
 	"github.com/codeownersnet/goa/tool/readfile"
+	"github.com/codeownersnet/goa/tool/truncate"
 	"github.com/codeownersnet/goa/tool/writefile"
 )
 
@@ -149,6 +150,7 @@ func main() {
 			`Verify code changes before reporting success.`,
 		Tools:             tools,
 		RequestProcessors: []flow.RequestProcessor{planBundle.Reminder},
+		ResultPolicy:      flow.NewTruncateResultPolicy(flow.TruncatePolicyConfig{SpillDir: truncate.DefaultDir()}),
 	})
 	if err != nil {
 		log.Fatal(err)

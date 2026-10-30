@@ -237,6 +237,80 @@ func (m *staticModel) GenerateContent(_ context.Context, _ *model.ModelRequest, 
 	}
 }
 
+func TestRunnerPersistsOnlyCompleteStreamedAnswer(t *testing.T) {
+	ctx := context.Background()
+	fm := &streamingHistoryModel{}
+
+	a, err := llmagent.New(llmagent.Config{
+		Name:  "test-agent",
+		Model: fm,
+	})
+	require.NoError(t, err)
+
+	svc := session.InMemoryService()
+	r, err := New(Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    svc,
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+
+	for _, runErr := range r.Run(ctx, "user", "session", content.NewTextContent("first", content.RoleUser), agent.RunConfig{}) {
+		require.NoError(t, runErr)
+	}
+
+	getResp, err := svc.Get(ctx, &session.GetRequest{AppName: "test-app", UserID: "user", SessionID: "session"})
+	require.NoError(t, err)
+	require.Equal(t, 2, getResp.Session.Events().Len())
+	final := getResp.Session.Events().At(1)
+	assert.False(t, final.Partial)
+	assert.Equal(t, "Hello", final.Text())
+
+	for _, runErr := range r.Run(ctx, "user", "session", content.NewTextContent("second", content.RoleUser), agent.RunConfig{}) {
+		require.NoError(t, runErr)
+	}
+
+	require.Len(t, fm.reqs, 2)
+	history := fm.reqs[1].Contents
+	require.Len(t, history, 3)
+	require.Len(t, history[1].Parts, 1)
+	require.NotNil(t, history[1].Parts[0].Text)
+	assert.Equal(t, "Hello", history[1].Parts[0].Text.Text)
+}
+
+type streamingHistoryModel struct {
+	calls int
+	reqs  []*model.ModelRequest
+}
+
+func (m *streamingHistoryModel) Name() string { return "fake" }
+
+func (m *streamingHistoryModel) Capabilities() model.ModelCapabilities {
+	return model.ModelCapabilities{}
+}
+
+func (m *streamingHistoryModel) GenerateContent(_ context.Context, req *model.ModelRequest, _ bool) iter.Seq2[*model.ModelResponse, error] {
+	m.calls++
+	m.reqs = append(m.reqs, req)
+	return func(yield func(*model.ModelResponse, error) bool) {
+		if m.calls > 1 {
+			yield(&model.ModelResponse{Content: content.NewTextContent("done", content.RoleModel)}, nil)
+			return
+		}
+		if !yield(&model.ModelResponse{Content: content.NewTextContent("Hel", content.RoleModel), Partial: true}, nil) {
+			return
+		}
+		if !yield(&model.ModelResponse{Content: content.NewTextContent("lo", content.RoleModel), Partial: true}, nil) {
+			return
+		}
+		yield(&model.ModelResponse{
+			Content:      content.NewTextContent("Hello", content.RoleModel),
+			TurnComplete: true,
+		}, nil)
+	}
+}
+
 type scriptedStep struct {
 	resp *model.ModelResponse
 	err  error

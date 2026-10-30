@@ -14,6 +14,7 @@ type SSEScanner struct {
 	scanner *bufio.Scanner
 	event   SSEEvent
 	err     error
+	done    bool
 }
 
 func NewSSEScanner(r io.Reader) *SSEScanner {
@@ -23,6 +24,10 @@ func NewSSEScanner(r io.Reader) *SSEScanner {
 }
 
 func (s *SSEScanner) Next() bool {
+	if s.done {
+		return false
+	}
+
 	var dataLines []string
 
 	for s.scanner.Scan() {
@@ -43,8 +48,11 @@ func (s *SSEScanner) Next() bool {
 		}
 	}
 
-	if err := s.scanner.Err(); err != nil {
-		s.err = err
+	s.err = s.scanner.Err()
+	s.done = true
+	if len(dataLines) > 0 {
+		s.event = SSEEvent{Data: strings.Join(dataLines, "\n")}
+		return true
 	}
 	return false
 }

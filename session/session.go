@@ -46,6 +46,11 @@ type Event struct {
 	ModelResponse *content.Content
 	Usage         *model.Usage
 	FinishReason  model.FinishReason
+	ModelVersion  string
+	TurnComplete  bool
+	Interrupted   bool
+	ErrorCode     string
+	ErrorMessage  string
 }
 
 type EventActions struct {
