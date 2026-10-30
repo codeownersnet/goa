@@ -48,9 +48,27 @@ func TestAllowed(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "directory prefix match",
+			name:     "bare directory no longer grants children",
 			allowed:  []string{filepath.Join(dir, "sub")},
 			path:     filepath.Join(dir, "sub", "file.txt"),
+			expected: false,
+		},
+		{
+			name:     "bare directory exact match still allowed",
+			allowed:  []string{filepath.Join(dir, "sub")},
+			path:     filepath.Join(dir, "sub"),
+			expected: true,
+		},
+		{
+			name:     "recursive star star denies unrelated absolute path",
+			allowed:  []string{dir + "/**"},
+			path:     "/outside/x.txt",
+			expected: false,
+		},
+		{
+			name:     "basename txt match",
+			allowed:  []string{"*.txt"},
+			path:     filepath.Join(dir, "file.txt"),
 			expected: true,
 		},
 		{

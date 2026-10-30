@@ -2,7 +2,7 @@
 
 A Go agent framework with provider-agnostic core types and first-class multi-provider LLM support via [models.dev](https://models.dev).
 
-**Go 1.25+** · **MIT License** · **116 providers, 2000+ models**
+**Go 1.27+** · **MIT License** · **116 providers, 2000+ models**
 
 ## Why Goa?
 
@@ -19,10 +19,10 @@ go get github.com/codeownersnet/goa
 ```
 
 **Prerequisites**:
-- Go 1.25+ (required for `iter.Seq2` streaming)
+- Go 1.27+ (required for `iter.Seq2` streaming)
 - API keys for your chosen providers (set as environment variables)
 
-Goa has minimal dependencies — `gopkg.in/yaml.v3` (skill and workflow parsing), `github.com/stretchr/testify` (testing), `github.com/mattn/go-sqlite3` (persistent sessions), and `github.com/modelcontextprotocol/go-sdk/mcp` (MCP toolset).
+Goa has minimal dependencies — `gopkg.in/yaml.v3` (skill and workflow parsing), `github.com/stretchr/testify` (testing), `github.com/mattn/go-sqlite3` (persistent sessions), `github.com/google/go-github/v88` (GitHub tools), and `github.com/modelcontextprotocol/go-sdk/mcp` (MCP toolset).
 
 ## Quick Start
 
@@ -943,7 +943,7 @@ Tools:         tool/bash/  |  tool/editfile/  |  tool/grep/  ...
                tool/plantool/    (structured plan management)
                tool/registry/    (name → factory mapping)
 
-Utilities:     modelsdev/  |  parentmap/  |  telemetry/
+Utilities:     modelsdev/  |  parentmap/
 ```
 
 **Key design principle**: All core types are provider-agnostic. Provider adapters only import their own SDKs.
@@ -968,16 +968,6 @@ go run ./examples/hello_world
 # Override the default model
 go run ./examples/hello_world openai/gpt-4o
 ```
-
-## Telemetry
-
-The `telemetry/` package provides OpenTelemetry scaffolding (currently a stub):
-
-```go
-providers := telemetry.New()  // placeholder — returns no-op providers
-```
-
-Defines: `Providers` (TracerProvider, LoggerProvider), `StartInvokeAgentSpan`, `WrapYield`, `TraceAgentResult`.
 
 ## Contributing
 

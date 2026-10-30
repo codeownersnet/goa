@@ -68,10 +68,19 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *content
 				SessionID: sessionID,
 			})
 			if err != nil {
-				yield(nil, err)
-				return
+				retryResp, retryErr := r.sessionService.Get(ctx, &session.GetRequest{
+					AppName:   r.appName,
+					UserID:    userID,
+					SessionID: sessionID,
+				})
+				if retryErr != nil {
+					yield(nil, fmt.Errorf("create session: %w", err))
+					return
+				}
+				storedSession = retryResp.Session
+			} else {
+				storedSession = createResp.Session
 			}
-			storedSession = createResp.Session
 		} else {
 			storedSession = getResp.Session
 		}
@@ -101,10 +110,8 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *content
 		agentToRun := r.rootAgent
 		for event, err := range agentToRun.Run(invCtx) {
 			if err != nil {
-				if !yield(event, err) {
-					return
-				}
-				continue
+				yield(event, err)
+				return
 			}
 			if !event.Partial {
 				if err := r.sessionService.AppendEvent(ctx, storedSession, event); err != nil {

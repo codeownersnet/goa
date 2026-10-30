@@ -23,6 +23,7 @@ type Config struct {
 	MaxRetries       int
 	InitialRetryWait time.Duration
 	MaxRetryWait     time.Duration
+	HTTPClient       *http.Client
 }
 
 type Adapter struct {
@@ -32,9 +33,13 @@ type Adapter struct {
 }
 
 func New(cfg Config) *Adapter {
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{}
+	}
 	return &Adapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: client,
 		caps:   model.ModelCapabilities{ToolCall: true, StructuredOutput: false, Reasoning: true},
 	}
 }
@@ -185,9 +190,10 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 
 			case "message_delta":
 				if sseEvent.Usage != nil {
-					usage = &model.Usage{
-						CompletionTokens: sseEvent.Usage.OutputTokens,
+					if usage == nil {
+						usage = &model.Usage{}
 					}
+					usage.CompletionTokens = sseEvent.Usage.OutputTokens
 				}
 				if sseEvent.Delta != nil && sseEvent.Delta.StopReason != "" {
 					finishReason = fromAnthropicStopReason(sseEvent.Delta.StopReason)
@@ -195,10 +201,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 
 			case "message_start":
 				if sseEvent.Message != nil && sseEvent.Message.Usage != nil {
-					usage = &model.Usage{
-						PromptTokens:     sseEvent.Message.Usage.InputTokens,
-						CompletionTokens: sseEvent.Message.Usage.OutputTokens,
-					}
+					usage = fromAnthropicUsage(sseEvent.Message.Usage)
 				}
 			}
 		}

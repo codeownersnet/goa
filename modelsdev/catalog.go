@@ -1,5 +1,7 @@
 package modelsdev
 
+import "encoding/json"
+
 type Catalog struct {
 	Providers []Provider `json:"providers"`
 }
@@ -35,6 +37,37 @@ type Model struct {
 type Modalities struct {
 	Input  []string `json:"input"`
 	Output []string `json:"output"`
+}
+
+func (p *Provider) UnmarshalJSON(data []byte) error {
+	type providerAlias Provider
+	var raw struct {
+		providerAlias
+		Models json.RawMessage `json:"models"`
+	}
+	raw.providerAlias = providerAlias(*p)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	var models []Model
+	if len(raw.Models) > 0 && string(raw.Models) != "null" {
+		var byID map[string]Model
+		if err := json.Unmarshal(raw.Models, &byID); err == nil && byID != nil {
+			for id, m := range byID {
+				if m.ID == "" {
+					m.ID = id
+				}
+				models = append(models, m)
+			}
+		} else if err := json.Unmarshal(raw.Models, &models); err != nil {
+			return err
+		}
+	}
+
+	*p = Provider(raw.providerAlias)
+	p.Models = models
+	return nil
 }
 
 type Cost struct {

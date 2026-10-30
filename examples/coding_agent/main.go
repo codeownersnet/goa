@@ -50,7 +50,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	m, err := reg.Resolve(ctx, "synthetic/hf:zai-org/GLM-5.1",
+	m, err := reg.Resolve(ctx, "synthetic/hf:zai-org/GLM-5.2",
 		provider.WithAPIKey(apiKey),
 	)
 	if err != nil {

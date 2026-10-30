@@ -3,7 +3,7 @@
 ## Project Overview
 
 - **Module**: `github.com/codeownersnet/goa`
-- **Language**: Go 1.23+ (required for `iter.Seq2`)
+- **Language**: Go 1.27+ (required for `iter.Seq2`)
 - **Purpose**: Multi-provider Go agent framework
 - **License**: MIT
 
@@ -35,7 +35,7 @@ Enabled linters (`.golangci.yml`):
 
 ## Code Style & Conventions
 
-- **Functional options pattern**: `type Option func(*config)` — used for all configuration (agent, provider, skill, telemetry, modelsdev)
+- **Functional options pattern**: `type Option func(*config)` — used for all configuration (agent, provider, skill, memory, modelsdev)
 - **Interface-driven design**: define interfaces in core packages, implement in sub-packages
 - **Error wrapping**: always use `fmt.Errorf("context: %w", err)` with `%w`
 - **iter.Seq2 for streaming**: all streaming APIs return `iter.Seq2[T, error]` — never channels
@@ -54,7 +54,7 @@ agent/sequentialagent/ — Sequential workflow agent: runs sub-agents in order
 agent/loopagent/    — Loop workflow agent: repeats sub-agents until escalation or max iterations
 agent/parallelagent/ — Parallel workflow agent: runs sub-agents concurrently
 artifact/           — Artifact service: versioned file storage per session
-cmd/embed-catalog/  — Tool to embed models.dev catalog (placeholder)
+cmd/embed-catalog/  — Tool to refresh the embedded models.dev catalog snapshot
 cmd/goafl/          — CLI: run, list, validate workflow YAML files
 content/            — Provider-agnostic content types: Content, Part, FunctionCall, ToolDeclaration
 flow/               — Execution loop: preprocess → callLLM → postprocess → handleTools → loop
@@ -71,7 +71,7 @@ session/            — Session service, State, Event, EventActions, in-memory i
 session/sqlite/      — SQLite session backend (persistent storage)
 skill/              — Skill loading, registry, validation, prompt generation
 skill/skilltool/    — Built-in tools: ActivateTool, ResourceTool, ScriptTool
-telemetry/          — OpenTelemetry stub (placeholder)
+testutil/           — Shared test helpers (scripted fake model)
 tool/               — Tool interface, Toolset, Context, Declarer, EventActions
 tool/agenttool/     — Agent-as-Tool: wraps an Agent as a Tool
 tool/bash/          — Bash: runs a single shell command, configurable allow/deny lists
@@ -80,6 +80,7 @@ tool/editfile/      — EditFile: applies string replacements to a file (9 fuzzy
 tool/exitlooptool/  — ExitLoopTool: signals LoopAgent to break via EventActions.Escalate
 tool/functiontool/  — Generic type-safe tool creation with schema inference
 tool/git/           — Git: clone, pull, push, add, branch, commit, stash, status, diff, log, checkout
+tool/github/        — GitHub: PR fetch, review comments, creating reviews
 tool/glob/          — Glob: finds files by glob pattern in a directory
 tool/grep/          — Grep: searches file contents by regex in a directory
 tool/internal/pathguard/ — Internal: path allowlist enforcement for file tools
@@ -153,7 +154,7 @@ For skill-integrated tools, add to `skill/skilltool/`.
   - `memory.InMemoryService()`
   - `artifact.InMemoryService()`
 - **Offline provider tests**: use `provider.NewRegistry(ctx, provider.WithRegistryOffline())` to avoid network calls
-- **Test utility**: `testutil/` exists but is currently empty — reserved for shared test helpers
+- **Test utility**: `testutil/` — shared test helpers, e.g. a scripted fake `model.Model` that records requests and the stream flag
 
 ## Import Conventions
 
@@ -166,9 +167,7 @@ For skill-integrated tools, add to `skill/skilltool/`.
 
 - **MCP toolset**: `tool/mcptoolset/` — supports tools, resources, and prompts; uses `github.com/modelcontextprotocol/go-sdk/mcp`; stdio and Streamable HTTP transports; no OAuth yet
 - **Workflow YAML**: `parallel` agent type is not supported in YAML; `BeforeAgentCallback`/`AfterAgentCallbacks` and `RequestProcessors` not configurable from YAML
-- **Telemetry**: `telemetry/` is a stub with no-op implementations
 - **Memory search**: `memory.InMemoryService()` uses substring matching only (no vector search)
-- **Embedded catalog fallback**: `cmd/embed-catalog/` is empty — offline mode (`WithRegistryOffline()`) will fail if catalog hasn't been previously fetched
 - **Provider type inference**: `modelsdev/infer.go` maps only `anthropic` and `kimi-for-coding` to `ProviderTypeAnthropic`; all other providers default to `ProviderTypeOpenAI`
 
 ## SKILL.md Format Reference

@@ -47,12 +47,11 @@ func (g *PathGuard) Allowed(path string) bool {
 		if err == nil && matched {
 			return true
 		}
-		matched, err = filepath.Match(pattern, filepath.Base(abs))
-		if err == nil && matched {
-			return true
-		}
-		if filepath.Dir(abs) == pattern {
-			return true
+		if !strings.ContainsRune(pattern, filepath.Separator) {
+			matched, err = filepath.Match(pattern, filepath.Base(abs))
+			if err == nil && matched {
+				return true
+			}
 		}
 	}
 	for _, pattern := range g.allowed {
@@ -60,11 +59,13 @@ func (g *PathGuard) Allowed(path string) bool {
 		if err != nil {
 			continue
 		}
+		subWild := strings.HasSuffix(pattern, string(filepath.Separator)+"**") ||
+			strings.HasSuffix(pattern, string(filepath.Separator)+"*")
 		for _, m := range matched {
 			if abs == m {
 				return true
 			}
-			if abs == m || filepath.Dir(abs) == m {
+			if subWild && strings.HasPrefix(abs, m+string(filepath.Separator)) {
 				return true
 			}
 		}
