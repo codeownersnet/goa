@@ -293,6 +293,55 @@ func TestStreamingFlagFromRunConfig(t *testing.T) {
 	}
 }
 
+func TestEventCarriesModelMetadata(t *testing.T) {
+	m := &testutil.ScriptedModel{
+		Script: func(_ int, _ *model.ModelRequest, _ bool) iter.Seq2[*model.ModelResponse, error] {
+			return func(yield func(*model.ModelResponse, error) bool) {
+				yield(&model.ModelResponse{
+					Content:      content.NewTextContent("Done!", content.RoleModel),
+					FinishReason: model.FinishReasonStop,
+					ModelVersion: "model-v1",
+					TurnComplete: true,
+					Interrupted:  false,
+					ErrorCode:    "code",
+					ErrorMessage: "message",
+				}, nil)
+			}
+		},
+	}
+
+	a := agent.New(
+		agent.WithName("test"),
+		agent.WithDescription("test"),
+		agent.WithRun(func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			f := &Flow{Model: m, Instruction: "Do work"}
+			return f.Run(ctx)
+		}),
+	)
+
+	r, err := runner.New(runner.Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+
+	var events []*session.Event
+	for ev, runErr := range r.Run(context.Background(), "user", "session", content.NewTextContent("do it", content.RoleUser), agent.RunConfig{}) {
+		require.NoError(t, runErr)
+		events = append(events, ev)
+	}
+
+	require.Len(t, events, 1)
+	event := events[0]
+	assert.Equal(t, "model-v1", event.ModelVersion)
+	assert.True(t, event.TurnComplete)
+	assert.False(t, event.Interrupted)
+	assert.Equal(t, "code", event.ErrorCode)
+	assert.Equal(t, "message", event.ErrorMessage)
+}
+
 func TestUnknownToolReturnsErrorResponseWithAvailableTools(t *testing.T) {
 	ctx := context.Background()
 	m := &unknownToolModel{}
@@ -406,4 +455,49 @@ func TestAllToolsMergesToolsets(t *testing.T) {
 	}
 	assert.Equal(t, []string{"shared", "static", "dynamic"}, names)
 	assert.Contains(t, f.buildToolDeclarations(), "dynamic")
+}
+
+func TestToolResultPolicyIsApplied(t *testing.T) {
+	applied := false
+	policy := ResultPolicyFunc(func(_ tool.Context, result map[string]any) (map[string]any, error) {
+		applied = true
+		result["policy"] = "applied"
+		return result, nil
+	})
+
+	echoTool, err := functiontool.New(functiontool.Config{
+		Name:        "echo",
+		Description: "Echoes a value.",
+	}, func(_ context.Context, args echoArgs) (map[string]any, error) {
+		return map[string]any{"value": args.Value}, nil
+	})
+	require.NoError(t, err)
+
+	a := agent.New(
+		agent.WithName("test"),
+		agent.WithDescription("test"),
+		agent.WithRun(func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			f := &Flow{
+				Model:        &capturingArgsModel{},
+				Tools:        []tool.Tool{echoTool},
+				Instruction:  "Do work",
+				ResultPolicy: policy,
+			}
+			return f.Run(ctx)
+		}),
+	)
+
+	r, err := runner.New(runner.Config{
+		AppName:           "test-app",
+		Agent:             a,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+
+	for _, runErr := range r.Run(context.Background(), "user", "session", content.NewTextContent("do it", content.RoleUser), agent.RunConfig{}) {
+		require.NoError(t, runErr)
+	}
+
+	assert.True(t, applied)
 }

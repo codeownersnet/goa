@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 
@@ -147,6 +148,74 @@ func TestAppendEvent(t *testing.T) {
 	assert.Equal(t, 1.0, val)
 
 	assert.Equal(t, 1, getResp.Session.Events().Len())
+}
+
+func TestAppendEventPersistsModelMetadata(t *testing.T) {
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	createResp, err := svc.Create(ctx, &session.CreateRequest{
+		AppName: "app", UserID: "u1", SessionID: "s1",
+	})
+	require.NoError(t, err)
+
+	event := session.NewEvent("inv-1")
+	event.ModelVersion = "model-v1"
+	event.TurnComplete = true
+	event.Interrupted = true
+	event.ErrorCode = "code"
+	event.ErrorMessage = "message"
+
+	err = svc.AppendEvent(ctx, createResp.Session, event)
+	require.NoError(t, err)
+
+	getResp, err := svc.Get(ctx, &session.GetRequest{
+		AppName: "app", UserID: "u1", SessionID: "s1",
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, getResp.Session.Events().Len())
+	stored := getResp.Session.Events().At(0)
+	assert.Equal(t, "model-v1", stored.ModelVersion)
+	assert.True(t, stored.TurnComplete)
+	assert.True(t, stored.Interrupted)
+	assert.Equal(t, "code", stored.ErrorCode)
+	assert.Equal(t, "message", stored.ErrorMessage)
+}
+
+func TestMigrateAddsEventMetadataColumns(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE events (
+			app_name TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			event_id TEXT NOT NULL,
+			timestamp DATETIME NOT NULL,
+			invocation_id TEXT NOT NULL DEFAULT '',
+			branch TEXT NOT NULL DEFAULT '',
+			author TEXT NOT NULL DEFAULT '',
+			partial BOOLEAN NOT NULL DEFAULT 0,
+			actions TEXT NOT NULL DEFAULT '{}',
+			model_response TEXT NOT NULL DEFAULT '',
+			usage TEXT NOT NULL DEFAULT '',
+			finish_reason TEXT NOT NULL DEFAULT ''
+		);
+	`)
+	require.NoError(t, err)
+
+	require.NoError(t, migrate(ctx, db))
+
+	for _, column := range []string{"model_version", "turn_complete", "interrupted", "error_code", "error_message"} {
+		var count int
+		err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = ?`, column).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "missing column %s", column)
+	}
 }
 
 func TestAppendPartialEvent(t *testing.T) {

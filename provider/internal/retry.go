@@ -8,9 +8,13 @@ import (
 	"time"
 )
 
-func RetryConfig(maxRetries int, initialWait, maxWait time.Duration) (int, time.Duration, time.Duration) {
-	if maxRetries <= 0 {
-		maxRetries = 5
+const defaultMaxRetries = 5
+
+func RetryConfig(maxRetries int, singleAttempt bool, initialWait, maxWait time.Duration) (int, time.Duration, time.Duration) {
+	if singleAttempt {
+		maxRetries = 0
+	} else if maxRetries <= 0 {
+		maxRetries = defaultMaxRetries
 	}
 	if initialWait <= 0 {
 		initialWait = 2 * time.Second

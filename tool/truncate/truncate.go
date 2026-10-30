@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -14,13 +15,17 @@ const (
 	MaxBytes = 50 * 1024
 )
 
-var truncationDir = func() string {
+var truncationDir = sync.OnceValue(func() string {
 	home, _ := os.UserHomeDir()
 	if home != "" {
 		return filepath.Join(home, ".local", "share", "goa", "tool-output")
 	}
 	return filepath.Join(os.TempDir(), "goa", "tool-output")
-}()
+})
+
+func DefaultDir() string {
+	return truncationDir()
+}
 
 type Options struct {
 	MaxLines  int
@@ -99,22 +104,8 @@ func Truncate(output string, opts Options) Result {
 	}
 
 	preview := strings.Join(out, "\n")
-	outputPath := filepath.Join(truncationDir, fmt.Sprintf("tool_%d", time.Now().UnixNano()))
 
 	hint := "The tool call succeeded but the output was truncated."
-	if err := os.MkdirAll(truncationDir, 0o755); err == nil {
-		if err := os.WriteFile(outputPath, []byte(output), 0o644); err == nil {
-			hint = fmt.Sprintf(
-				"%s Full output saved to: %s\nUse Grep to search the full content or ReadFile with offset/limit to view specific sections.",
-				hint,
-				outputPath,
-			)
-		} else {
-			outputPath = ""
-		}
-	} else {
-		outputPath = ""
-	}
 
 	var content string
 	if direction == "head" {
@@ -124,9 +115,8 @@ func Truncate(output string, opts Options) Result {
 	}
 
 	return Result{
-		Content:    content,
-		Truncated:  true,
-		OutputPath: outputPath,
+		Content:   content,
+		Truncated: true,
 	}
 }
 
@@ -152,7 +142,8 @@ func Cleanup(maxAge time.Duration) {
 	if maxAge <= 0 {
 		maxAge = 7 * 24 * time.Hour
 	}
-	entries, err := os.ReadDir(truncationDir)
+	dir := truncationDir()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
@@ -166,7 +157,7 @@ func Cleanup(maxAge time.Duration) {
 			continue
 		}
 		if info.ModTime().Before(cutoff) {
-			os.Remove(filepath.Join(truncationDir, entry.Name()))
+			os.Remove(filepath.Join(dir, entry.Name()))
 		}
 	}
 }

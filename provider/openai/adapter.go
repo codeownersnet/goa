@@ -2,8 +2,8 @@ package openai
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"net/http"
 	"sort"
@@ -17,13 +17,22 @@ import (
 )
 
 type Config struct {
-	BaseURL          string
-	APIKey           string
-	ProviderModelID  string
-	MaxRetries       int
-	InitialRetryWait time.Duration
-	MaxRetryWait     time.Duration
-	HTTPClient       *http.Client
+	BaseURL            string
+	APIKey             string
+	ProviderModelID    string
+	MaxRetries         int
+	SingleAttempt      bool
+	MaxStreamBytes     int
+	MaxStreamToolCalls int
+	MaxResponseBytes   int
+	MaxErrorBodyBytes  int
+	StreamIdleTimeout  time.Duration
+	DisableRedirects   bool
+	CheckRedirect      func(*http.Request, []*http.Request) error
+	BeforeAttempt      func(context.Context, int) error
+	InitialRetryWait   time.Duration
+	MaxRetryWait       time.Duration
+	HTTPClient         *http.Client
 }
 
 type Adapter struct {
@@ -33,10 +42,7 @@ type Adapter struct {
 }
 
 func New(cfg Config) *Adapter {
-	client := cfg.HTTPClient
-	if client == nil {
-		client = &http.Client{}
-	}
+	client := internal.NewHTTPClient(cfg.HTTPClient, cfg.DisableRedirects, cfg.CheckRedirect)
 	return &Adapter{
 		cfg:    cfg,
 		client: client,
@@ -64,9 +70,12 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 		return nil, fmt.Errorf("build openai request: %w", err)
 	}
 
-	maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
+	maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.SingleAttempt, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := a.beforeAttempt(ctx, attempt); err != nil {
+			return nil, err
+		}
 		if err := internal.WaitBeforeRetry(ctx, attempt, initialWait, maxWait); err != nil {
 			return nil, err
 		}
@@ -78,6 +87,10 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
+			var redirectErr *internal.RedirectError
+			if errors.As(err, &redirectErr) {
+				return nil, fmt.Errorf("call openai api: %w", err)
+			}
 			if attempt < maxRetries {
 				continue
 			}
@@ -86,7 +99,8 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 
 		if resp.StatusCode == http.StatusOK {
 			var completion chatCompletionResponse
-			if err := internal.DecodeJSON(resp.Body, &completion); err != nil {
+			maxResponseBytes := internal.StreamLimit(a.cfg.MaxResponseBytes, internal.DefaultMaxResponseBytes)
+			if err := internal.DecodeJSONLimited(resp.Body, &completion, maxResponseBytes); err != nil {
 				resp.Body.Close()
 				return nil, fmt.Errorf("decode openai response: %w", err)
 			}
@@ -95,11 +109,11 @@ func (a *Adapter) generate(ctx context.Context, req *model.ModelRequest) (*model
 		}
 
 		statusCode := resp.StatusCode
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		info := internal.ReadErrorInfo(resp.Body, internal.StreamLimit(a.cfg.MaxErrorBodyBytes, internal.DefaultMaxErrorBodyBytes))
 		resp.Body.Close()
 
 		if !internal.IsRetryableStatus(statusCode) {
-			return nil, fmt.Errorf("openai api returned HTTP %d: %s", statusCode, errBody)
+			return nil, a.providerError(resp, statusCode, info.Code)
 		}
 
 		if after := internal.RetryAfter(resp); after > 0 {
@@ -121,7 +135,7 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		body.Stream = true
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
 
-		maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
+		maxRetries, initialWait, maxWait := internal.RetryConfig(a.cfg.MaxRetries, a.cfg.SingleAttempt, a.cfg.InitialRetryWait, a.cfg.MaxRetryWait)
 		resp, err := a.openStream(ctx, body, maxRetries, initialWait, maxWait)
 		if err != nil {
 			yield(nil, err)
@@ -129,26 +143,47 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 		}
 		defer resp.Body.Close()
 
-		accumulator := newToolCallAccumulator()
+		accumulator := newStreamAccumulator()
 		scanner := newSSEScanner(resp.Body)
 
+		maxStreamBytes := internal.StreamLimit(a.cfg.MaxStreamBytes, internal.DefaultMaxStreamBytes)
+		maxToolCalls := internal.StreamLimit(a.cfg.MaxStreamToolCalls, internal.DefaultMaxStreamToolCalls)
+		streamBytes := 0
+		emitted := false
+		sawFinishReason := false
+		sawDone := false
+
 		var usage *model.Usage
+		var modelVersion string
 		finishReason := model.FinishReasonStop
 
 	scan:
 		for scanner.Next() {
 			event := scanner.Event()
-			if event.Data == "[DONE]" {
+			streamBytes += len(event.Data)
+			if streamBytes > maxStreamBytes {
+				yield(nil, newStreamError(model.StreamErrorLimit, emitted, fmt.Errorf("stream exceeded %d bytes", maxStreamBytes)))
+				return
+			}
+			if strings.TrimSpace(event.Data) == "[DONE]" {
+				sawDone = true
 				break scan
+			}
+			if strings.TrimSpace(event.Data) == "" {
+				continue
 			}
 
 			var chunk chatCompletionChunk
 			if err := internal.DecodeJSONString(event.Data, &chunk); err != nil {
-				continue
+				yield(nil, newStreamError(model.StreamErrorMalformed, emitted, fmt.Errorf("decode stream chunk: %w", err)))
+				return
 			}
 
 			if chunk.Usage != nil {
 				usage = fromOpenAIUsage(chunk.Usage)
+			}
+			if chunk.Model != "" {
+				modelVersion = chunk.Model
 			}
 
 			if len(chunk.Choices) == 0 {
@@ -156,10 +191,17 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 			}
 
 			choice := chunk.Choices[0]
-			if fr := fromOpenAIFinishReason(choice.FinishReason); fr != model.FinishReasonUnknown {
-				finishReason = fr
+			if choice.FinishReason != "" {
+				sawFinishReason = true
+				if fr := fromOpenAIFinishReason(choice.FinishReason); fr != model.FinishReasonUnknown {
+					finishReason = fr
+				}
 			}
 			parts := a.processChunk(choice, accumulator)
+			if accumulator.toolCalls.count() > maxToolCalls {
+				yield(nil, newStreamError(model.StreamErrorLimit, emitted, fmt.Errorf("stream exceeded %d tool calls", maxToolCalls)))
+				return
+			}
 
 			if len(parts) > 0 {
 				partialResp := &model.ModelResponse{
@@ -169,11 +211,22 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 				if !yield(partialResp, nil) {
 					return
 				}
+				emitted = true
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
-			yield(nil, fmt.Errorf("scan sse stream: %w", err))
+			yield(nil, newStreamError(model.StreamErrorIncomplete, emitted, fmt.Errorf("scan sse stream: %w", err)))
+			return
+		}
+		if !sawDone && !sawFinishReason {
+			yield(nil, newStreamError(model.StreamErrorIncomplete, emitted, fmt.Errorf("stream ended without finish reason or done marker")))
+			return
+		}
+
+		finalParts, err := accumulator.finalize()
+		if err != nil {
+			yield(nil, newStreamError(model.StreamErrorInvalidToolCall, emitted, err))
 			return
 		}
 
@@ -182,16 +235,42 @@ func (a *Adapter) generateStream(ctx context.Context, req *model.ModelRequest) i
 			Partial:      false,
 			Usage:        usage,
 			FinishReason: finishReason,
+			ModelVersion: modelVersion,
 		}
-		if final := accumulator.finalize(); len(final) > 0 {
-			finalResp.Content = content.NewContent(content.RoleModel, final...)
+		if len(finalParts) > 0 {
+			finalResp.Content = content.NewContent(content.RoleModel, finalParts...)
 		}
 		yield(finalResp, nil)
 	}
 }
 
+func (a *Adapter) beforeAttempt(ctx context.Context, attempt int) error {
+	if a.cfg.BeforeAttempt != nil {
+		return a.cfg.BeforeAttempt(ctx, attempt)
+	}
+	return nil
+}
+
+func (a *Adapter) providerError(resp *http.Response, statusCode int, code string) error {
+	return &model.ProviderError{
+		Provider:   "openai",
+		StatusCode: statusCode,
+		Code:       code,
+		Retryable:  internal.IsRetryableStatus(statusCode),
+		RetryAfter: internal.RetryAfter(resp),
+		RequestID:  internal.ProviderRequestID(resp.Header),
+	}
+}
+
+func newStreamError(kind model.StreamErrorKind, interrupted bool, err error) error {
+	return fmt.Errorf("openai stream: %w", &model.StreamError{Kind: kind, Interrupted: interrupted, Err: err})
+}
+
 func (a *Adapter) openStream(ctx context.Context, body *chatCompletionRequest, maxRetries int, initialWait, maxWait time.Duration) (*http.Response, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := a.beforeAttempt(ctx, attempt); err != nil {
+			return nil, err
+		}
 		if err := internal.WaitBeforeRetry(ctx, attempt, initialWait, maxWait); err != nil {
 			return nil, err
 		}
@@ -203,6 +282,10 @@ func (a *Adapter) openStream(ctx context.Context, body *chatCompletionRequest, m
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
+			var redirectErr *internal.RedirectError
+			if errors.As(err, &redirectErr) {
+				return nil, fmt.Errorf("call openai streaming api: %w", err)
+			}
 			if attempt < maxRetries {
 				continue
 			}
@@ -210,6 +293,9 @@ func (a *Adapter) openStream(ctx context.Context, body *chatCompletionRequest, m
 		}
 
 		if resp.StatusCode == http.StatusOK {
+			if a.cfg.StreamIdleTimeout > 0 {
+				resp.Body = internal.NewIdleTimeoutReader(resp.Body, a.cfg.StreamIdleTimeout)
+			}
 			return resp, nil
 		}
 
@@ -217,29 +303,31 @@ func (a *Adapter) openStream(ctx context.Context, body *chatCompletionRequest, m
 		if after := internal.RetryAfter(resp); after > 0 {
 			initialWait = after
 		}
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		info := internal.ReadErrorInfo(resp.Body, internal.StreamLimit(a.cfg.MaxErrorBodyBytes, internal.DefaultMaxErrorBodyBytes))
 		resp.Body.Close()
 
 		if !internal.IsRetryableStatus(statusCode) {
-			return nil, fmt.Errorf("openai streaming api returned HTTP %d: %s", statusCode, errBody)
+			return nil, a.providerError(resp, statusCode, info.Code)
 		}
 	}
 
 	return nil, fmt.Errorf("openai streaming api: max retries (%d) exceeded", maxRetries)
 }
 
-func (a *Adapter) processChunk(choice chatCompletionChoice, acc *toolCallAccumulator) []content.Part {
+func (a *Adapter) processChunk(choice chatCompletionChoice, acc *streamAccumulator) []content.Part {
 	var parts []content.Part
 
 	if choice.Delta != nil {
 		if choice.Delta.Content != "" {
+			acc.text.WriteString(choice.Delta.Content)
 			parts = append(parts, content.NewTextPart(choice.Delta.Content))
 		}
 		if choice.Delta.ReasoningContent != "" {
+			acc.thinking.WriteString(choice.Delta.ReasoningContent)
 			parts = append(parts, content.NewThinkingPart(choice.Delta.ReasoningContent))
 		}
 		for _, tc := range choice.Delta.ToolCalls {
-			acc.feed(tc.Index, tc)
+			acc.toolCalls.feed(tc.Index, tc)
 		}
 	}
 
@@ -247,6 +335,31 @@ func (a *Adapter) processChunk(choice chatCompletionChoice, acc *toolCallAccumul
 }
 
 var _ model.Model = (*Adapter)(nil)
+
+type streamAccumulator struct {
+	toolCalls *toolCallAccumulator
+	text      strings.Builder
+	thinking  strings.Builder
+}
+
+func newStreamAccumulator() *streamAccumulator {
+	return &streamAccumulator{toolCalls: newToolCallAccumulator()}
+}
+
+func (a *streamAccumulator) finalize() ([]content.Part, error) {
+	parts := make([]content.Part, 0, 3)
+	if a.thinking.Len() > 0 {
+		parts = append(parts, content.NewThinkingPart(a.thinking.String()))
+	}
+	if a.text.Len() > 0 {
+		parts = append(parts, content.NewTextPart(a.text.String()))
+	}
+	toolParts, err := a.toolCalls.finalize()
+	if err != nil {
+		return nil, err
+	}
+	return append(parts, toolParts...), nil
+}
 
 type toolCallAccumulator struct {
 	mu          sync.Mutex
@@ -283,7 +396,13 @@ func (a *toolCallAccumulator) feed(index int, chunk toolCallChunk) {
 	a.argsBuffers[index].WriteString(chunk.Function.Arguments)
 }
 
-func (a *toolCallAccumulator) finalize() []content.Part {
+func (a *toolCallAccumulator) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.calls)
+}
+
+func (a *toolCallAccumulator) finalize() ([]content.Part, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -298,10 +417,20 @@ func (a *toolCallAccumulator) finalize() []content.Part {
 		fc := a.calls[i]
 		buf, ok := a.argsBuffers[i]
 		if !ok {
-			continue
+			return nil, fmt.Errorf("tool call %d has no argument buffer", i)
 		}
-		fc.Args = parseArgsJSON(buf.String())
+		if fc.ID == "" {
+			return nil, fmt.Errorf("tool call %d is missing an id", i)
+		}
+		if fc.Name == "" {
+			return nil, fmt.Errorf("tool call %d is missing a name", i)
+		}
+		args, err := parseArgsJSONStrict(buf.String())
+		if err != nil {
+			return nil, fmt.Errorf("tool call %q has invalid arguments: %w", fc.Name, err)
+		}
+		fc.Args = args
 		parts = append(parts, content.Part{FunctionCall: fc})
 	}
-	return parts
+	return parts, nil
 }

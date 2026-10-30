@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"iter"
 	"strings"
+	"time"
 
 	"github.com/codeownersnet/goa/agent"
 	"github.com/codeownersnet/goa/content"
@@ -18,27 +19,50 @@ type Config struct {
 	Description string
 	SubAgents   []agent.Agent
 
-	Model             model.Model
-	Instruction       string
-	Tools             []tool.Tool
-	Toolsets          []tool.Toolset
-	GenerateConfig    *model.GenerateConfig
-	RequestProcessors []flow.RequestProcessor
-	RequireToolUse    bool
+	Model              model.Model
+	Instruction        string
+	Tools              []tool.Tool
+	Toolsets           []tool.Toolset
+	GenerateConfig     *model.GenerateConfig
+	MaxIterations      int
+	ToolTimeout        time.Duration
+	RequestProcessors  []flow.RequestProcessor
+	ResponseProcessors []func(agent.InvocationContext, *model.ModelRequest, *model.ModelResponse) error
+	ResultPolicy       flow.ResultPolicy
+	ExecutionOptions   flow.ExecutionOptions
+	RequireToolUse     bool
 
 	BeforeAgentCallbacks []agent.BeforeAgentCallback
 	AfterAgentCallbacks  []agent.AfterAgentCallback
+
+	BeforeModelCallbacks  []flow.BeforeModelCallback
+	AfterModelCallbacks   []flow.AfterModelCallback
+	OnModelErrorCallbacks []flow.OnModelErrorCallback
+	BeforeToolCallbacks   []flow.BeforeToolCallback
+	AfterToolCallbacks    []flow.AfterToolCallback
+	OnToolErrorCallbacks  []flow.OnToolErrorCallback
 }
 
 func New(cfg Config) (*Agent, error) {
 	a := &Agent{
-		model:             cfg.Model,
-		instruction:       cfg.Instruction,
-		tools:             cfg.Tools,
-		toolsets:          cfg.Toolsets,
-		generateConfig:    cfg.GenerateConfig,
-		requestProcessors: cfg.RequestProcessors,
-		requireToolUse:    cfg.RequireToolUse,
+		model:                 cfg.Model,
+		instruction:           cfg.Instruction,
+		tools:                 cfg.Tools,
+		toolsets:              cfg.Toolsets,
+		generateConfig:        cfg.GenerateConfig,
+		maxIterations:         cfg.MaxIterations,
+		toolTimeout:           cfg.ToolTimeout,
+		requestProcessors:     cfg.RequestProcessors,
+		responseProcessors:    cfg.ResponseProcessors,
+		resultPolicy:          cfg.ResultPolicy,
+		executionOptions:      cfg.ExecutionOptions,
+		requireToolUse:        cfg.RequireToolUse,
+		beforeModelCallbacks:  cfg.BeforeModelCallbacks,
+		afterModelCallbacks:   cfg.AfterModelCallbacks,
+		onModelErrorCallbacks: cfg.OnModelErrorCallbacks,
+		beforeToolCallbacks:   cfg.BeforeToolCallbacks,
+		afterToolCallbacks:    cfg.AfterToolCallbacks,
+		onToolErrorCallbacks:  cfg.OnToolErrorCallbacks,
 	}
 
 	base := agent.New(
@@ -57,24 +81,46 @@ func New(cfg Config) (*Agent, error) {
 type Agent struct {
 	agent.Agent
 
-	model             model.Model
-	instruction       string
-	tools             []tool.Tool
-	toolsets          []tool.Toolset
-	generateConfig    *model.GenerateConfig
-	requestProcessors []flow.RequestProcessor
-	requireToolUse    bool
+	model                 model.Model
+	instruction           string
+	tools                 []tool.Tool
+	toolsets              []tool.Toolset
+	generateConfig        *model.GenerateConfig
+	maxIterations         int
+	toolTimeout           time.Duration
+	requestProcessors     []flow.RequestProcessor
+	responseProcessors    []func(agent.InvocationContext, *model.ModelRequest, *model.ModelResponse) error
+	resultPolicy          flow.ResultPolicy
+	executionOptions      flow.ExecutionOptions
+	requireToolUse        bool
+	beforeModelCallbacks  []flow.BeforeModelCallback
+	afterModelCallbacks   []flow.AfterModelCallback
+	onModelErrorCallbacks []flow.OnModelErrorCallback
+	beforeToolCallbacks   []flow.BeforeToolCallback
+	afterToolCallbacks    []flow.AfterToolCallback
+	onToolErrorCallbacks  []flow.OnToolErrorCallback
 }
 
 func (a *Agent) run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	f := &flow.Flow{
-		Model:             a.model,
-		Tools:             a.tools,
-		Toolsets:          a.toolsets,
-		Instruction:       a.instruction,
-		GenerateConfig:    a.generateConfig,
-		RequestProcessors: a.requestProcessors,
-		RequireToolUse:    a.requireToolUse,
+		Model:                 a.model,
+		Tools:                 a.tools,
+		Toolsets:              a.toolsets,
+		Instruction:           a.instruction,
+		GenerateConfig:        a.generateConfig,
+		MaxIterations:         a.maxIterations,
+		ToolTimeout:           a.toolTimeout,
+		RequestProcessors:     a.requestProcessors,
+		ResponseProcessors:    a.responseProcessors,
+		ResultPolicy:          a.resultPolicy,
+		ExecutionOptions:      a.executionOptions,
+		RequireToolUse:        a.requireToolUse,
+		BeforeModelCallbacks:  a.beforeModelCallbacks,
+		AfterModelCallbacks:   a.afterModelCallbacks,
+		OnModelErrorCallbacks: a.onModelErrorCallbacks,
+		BeforeToolCallbacks:   a.beforeToolCallbacks,
+		AfterToolCallbacks:    a.afterToolCallbacks,
+		OnToolErrorCallbacks:  a.onToolErrorCallbacks,
 	}
 
 	return func(yield func(*session.Event, error) bool) {

@@ -254,10 +254,11 @@ func (s *Service) AppendEvent(ctx context.Context, curSession session.Session, e
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO events (app_name, user_id, session_id, event_id, timestamp, invocation_id, branch, author, partial, actions, model_response, usage, finish_reason)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events (app_name, user_id, session_id, event_id, timestamp, invocation_id, branch, author, partial, actions, model_response, usage, finish_reason, model_version, turn_complete, interrupted, error_code, error_message)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		appName, userID, sessionID, event.ID, event.Timestamp, event.InvocationID, event.Branch, event.Author, event.Partial,
 		string(actionsJSON), modelRespJSON, usageJSON, string(event.FinishReason),
+		event.ModelVersion, event.TurnComplete, event.Interrupted, event.ErrorCode, event.ErrorMessage,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: insert event: %w", err)
@@ -327,7 +328,7 @@ func (s *Service) AppendEvent(ctx context.Context, curSession session.Session, e
 }
 
 func (s *Service) loadEvents(ctx context.Context, appName, userID, sessionID string, numRecent int, after time.Time) ([]*session.Event, error) {
-	columns := `event_id, timestamp, invocation_id, branch, author, partial, actions, model_response, usage, finish_reason`
+	columns := `event_id, timestamp, invocation_id, branch, author, partial, actions, model_response, usage, finish_reason, model_version, turn_complete, interrupted, error_code, error_message`
 	baseQuery := `SELECT ` + columns + ` FROM events WHERE app_name = ? AND user_id = ? AND session_id = ?`
 	limitedBaseQuery := `SELECT rowid AS event_rowid, ` + columns + ` FROM events WHERE app_name = ? AND user_id = ? AND session_id = ?`
 	args := []any{appName, userID, sessionID}
@@ -356,9 +357,10 @@ func (s *Service) loadEvents(ctx context.Context, appName, userID, sessionID str
 		var timestamp time.Time
 		var partial bool
 		var actionsJSON, modelRespJSON, usageJSON sql.NullString
-		var finishReason string
+		var finishReason, modelVersion, errorCode, errorMessage string
+		var turnComplete, interrupted bool
 
-		if err := rows.Scan(&id, &timestamp, &invocationID, &branch, &author, &partial, &actionsJSON, &modelRespJSON, &usageJSON, &finishReason); err != nil {
+		if err := rows.Scan(&id, &timestamp, &invocationID, &branch, &author, &partial, &actionsJSON, &modelRespJSON, &usageJSON, &finishReason, &modelVersion, &turnComplete, &interrupted, &errorCode, &errorMessage); err != nil {
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
 
@@ -370,6 +372,11 @@ func (s *Service) loadEvents(ctx context.Context, appName, userID, sessionID str
 			Author:       author,
 			Partial:      partial,
 			FinishReason: model.FinishReason(finishReason),
+			ModelVersion: modelVersion,
+			TurnComplete: turnComplete,
+			Interrupted:  interrupted,
+			ErrorCode:    errorCode,
+			ErrorMessage: errorMessage,
 		}
 
 		if actionsJSON.Valid && actionsJSON.String != "" {
@@ -519,7 +526,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			actions      TEXT NOT NULL DEFAULT '{}',
 			model_response TEXT NOT NULL DEFAULT '',
 			usage        TEXT NOT NULL DEFAULT '',
-			finish_reason TEXT NOT NULL DEFAULT ''
+			finish_reason TEXT NOT NULL DEFAULT '',
+			model_version TEXT NOT NULL DEFAULT '',
+			turn_complete BOOLEAN NOT NULL DEFAULT 0,
+			interrupted  BOOLEAN NOT NULL DEFAULT 0,
+			error_code   TEXT NOT NULL DEFAULT '',
+			error_message TEXT NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS idx_events_session
 			ON events (app_name, user_id, session_id);
@@ -527,5 +539,57 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("sqlite: migrate exec: %w", err)
 	}
+
+	return ensureEventColumns(ctx, db)
+}
+
+func ensureEventColumns(ctx context.Context, db *sql.DB) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{name: "model_version", ddl: "model_version TEXT NOT NULL DEFAULT ''"},
+		{name: "turn_complete", ddl: "turn_complete BOOLEAN NOT NULL DEFAULT 0"},
+		{name: "interrupted", ddl: "interrupted BOOLEAN NOT NULL DEFAULT 0"},
+		{name: "error_code", ddl: "error_code TEXT NOT NULL DEFAULT ''"},
+		{name: "error_message", ddl: "error_message TEXT NOT NULL DEFAULT ''"},
+	}
+
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(events)`)
+	if err != nil {
+		return fmt.Errorf("sqlite: inspect event columns: %w", err)
+	}
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			ctype    string
+			notNull  int
+			defaultV any
+			pk       int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &defaultV, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("sqlite: scan event column: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("sqlite: close event columns: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("sqlite: iterate event columns: %w", err)
+	}
+
+	for _, column := range columns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN `+column.ddl); err != nil {
+			return fmt.Errorf("sqlite: add event column %s: %w", column.name, err)
+		}
+	}
+
 	return nil
 }

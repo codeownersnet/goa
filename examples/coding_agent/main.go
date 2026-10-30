@@ -10,6 +10,7 @@ import (
 	"github.com/codeownersnet/goa/agent/llmagent"
 	"github.com/codeownersnet/goa/artifact"
 	"github.com/codeownersnet/goa/content"
+	"github.com/codeownersnet/goa/flow"
 	"github.com/codeownersnet/goa/memory"
 	"github.com/codeownersnet/goa/provider"
 	"github.com/codeownersnet/goa/provider/openai"
@@ -25,6 +26,7 @@ import (
 	"github.com/codeownersnet/goa/tool/grep"
 	"github.com/codeownersnet/goa/tool/listdir"
 	"github.com/codeownersnet/goa/tool/readfile"
+	"github.com/codeownersnet/goa/tool/truncate"
 	"github.com/codeownersnet/goa/tool/writefile"
 )
 
@@ -140,6 +142,7 @@ func main() {
 			globTool, grepTool, listDirTool, diffTool,
 			skilltool.NewActivateTool(skillReg), skilltool.NewResourceTool(skillReg),
 		},
+		ResultPolicy: flow.NewTruncateResultPolicy(flow.TruncatePolicyConfig{SpillDir: truncate.DefaultDir()}),
 	})
 	if err != nil {
 		log.Fatal(err)

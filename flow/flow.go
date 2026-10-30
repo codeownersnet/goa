@@ -15,7 +15,6 @@ import (
 	"github.com/codeownersnet/goa/model"
 	"github.com/codeownersnet/goa/session"
 	"github.com/codeownersnet/goa/tool"
-	"github.com/codeownersnet/goa/tool/truncate"
 )
 
 type BeforeModelCallback func(agent.InvocationContext, *model.ModelRequest) (*model.ModelResponse, error)
@@ -41,6 +40,8 @@ type Flow struct {
 	MaxIterations         int
 	RequireToolUse        bool
 	ToolTimeout           time.Duration
+	ResultPolicy          ResultPolicy
+	ExecutionOptions      ExecutionOptions
 	RequestProcessors     []RequestProcessor
 	ResponseProcessors    []func(agent.InvocationContext, *model.ModelRequest, *model.ModelResponse) error
 	BeforeModelCallbacks  []BeforeModelCallback
@@ -53,16 +54,44 @@ type Flow struct {
 
 func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
+		if f.Model == nil {
+			yield(nil, fmt.Errorf("model not configured"))
+			return
+		}
+
+		opts := f.ExecutionOptions
+		if err := opts.validateCapabilities(f.Model.Capabilities()); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		runCtx := ctx
+		if opts.Limits.RunDeadline > 0 {
+			deadlineCtx, cancel := context.WithTimeout(ctx, opts.Limits.RunDeadline)
+			defer cancel()
+			runCtx = ctx.WithContext(deadlineCtx)
+		}
+
+		budget := opts.budget()
 		maxIter := f.MaxIterations
 		if maxIter <= 0 {
 			maxIter = 25
 		}
 		detector := &doomLoopDetector{maxConsecutive: 3}
 		doomLoops := 0
+		validationRepairs := 0
 		usedTools := false
+
 		for i := 0; i < maxIter; i++ {
+			if opts.Limits.MaxModelTurns > 0 && budget.ModelTurns >= opts.Limits.MaxModelTurns {
+				yield(nil, fmt.Errorf("run exceeded %d model turns", opts.Limits.MaxModelTurns))
+				return
+			}
+			budget.ModelTurns++
+			budget.ToolCallsThisTurn = 0
+
 			var events []*session.Event
-			for ev, err := range f.runOneStep(ctx) {
+			for ev, err := range f.runOneStep(runCtx, budget) {
 				if err != nil {
 					yield(nil, err)
 					return
@@ -84,6 +113,37 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 					yield(nil, fmt.Errorf("agent stopped without using tools: text-only response"))
 					return
 				}
+
+				if lastEvent != nil && !lastEvent.Partial && opts.OutputValidator != nil {
+					if err := opts.OutputValidator.Validate(runCtx, lastEvent); err != nil {
+						if opts.MaxValidationRepairs > 0 && validationRepairs < opts.MaxValidationRepairs {
+							validationRepairs++
+							repair := session.NewEvent(runCtx.InvocationID())
+							repair.Author = "system"
+							repair.ModelResponse = &content.Content{
+								Role: content.RoleUser,
+								Parts: []content.Part{content.NewTextPart(
+									fmt.Sprintf("The previous response failed validation: %v. Provide a corrected response.", err),
+								)},
+							}
+							if !yield(repair, nil) {
+								return
+							}
+							continue
+						}
+						yield(nil, fmt.Errorf("output validation failed: %w", err))
+						return
+					}
+				}
+
+				if lastEvent != nil {
+					for _, guard := range opts.BeforeCompletionGuards {
+						if err := guard(runCtx, lastEvent); err != nil {
+							yield(nil, tool.NewDeniedError(fmt.Errorf("completion guard rejected response: %w", err)))
+							return
+						}
+					}
+				}
 				return
 			}
 			if lastEvent.Partial {
@@ -96,7 +156,7 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 					yield(nil, fmt.Errorf("doom loop detected: same tool calls repeated %d times across iterations", detector.maxConsecutive))
 					return
 				}
-				warning := session.NewEvent(ctx.InvocationID())
+				warning := session.NewEvent(runCtx.InvocationID())
 				warning.Author = "system"
 				warning.ModelResponse = &content.Content{
 					Role: content.RoleUser,
@@ -115,7 +175,7 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 	}
 }
 
-func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+func (f *Flow) runOneStep(ctx agent.InvocationContext, budget *RunBudget) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
 		if f.Model == nil {
 			yield(nil, fmt.Errorf("model not configured"))
@@ -142,6 +202,25 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 			return
 		}
 
+		opts := f.ExecutionOptions
+		if opts.ContextPolicy != nil {
+			if err := opts.ContextPolicy.Apply(ctx, req); err != nil {
+				yield(nil, fmt.Errorf("context policy rejected request: %w", err))
+				return
+			}
+		}
+		if opts.Limits.MaxPromptBytes > 0 {
+			size, err := requestBytes(req)
+			if err != nil {
+				yield(nil, fmt.Errorf("measure prompt: %w", err))
+				return
+			}
+			if size > opts.Limits.MaxPromptBytes {
+				yield(nil, fmt.Errorf("prompt exceeded %d bytes", opts.Limits.MaxPromptBytes))
+				return
+			}
+		}
+
 		for resp, err := range f.callLLM(ctx, req) {
 			if err != nil {
 				yield(nil, err)
@@ -155,6 +234,14 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 				continue
 			}
 
+			if !resp.Partial && opts.Limits.MaxOutputBytes > 0 {
+				budget.OutputBytes += responseTextBytes(resp)
+				if budget.OutputBytes > opts.Limits.MaxOutputBytes {
+					yield(nil, fmt.Errorf("output exceeded %d bytes", opts.Limits.MaxOutputBytes))
+					return
+				}
+			}
+
 			event := f.buildEvent(ctx, resp)
 			if !yield(event, nil) {
 				return
@@ -164,7 +251,7 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 				continue
 			}
 
-			ev, err := f.handleFunctionCalls(ctx, resp)
+			ev, err := f.handleFunctionCalls(ctx, resp, budget)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -235,6 +322,12 @@ func (f *Flow) postprocess(ctx agent.InvocationContext, req *model.ModelRequest,
 
 func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.ModelRequest) iter.Seq2[*model.ModelResponse, error] {
 	return func(yield func(*model.ModelResponse, error) bool) {
+		for _, guard := range f.ExecutionOptions.BeforeModelGuards {
+			if err := guard(ctx, req); err != nil {
+				yield(nil, tool.NewDeniedError(fmt.Errorf("model guard rejected request: %w", err)))
+				return
+			}
+		}
 		for _, cb := range f.BeforeModelCallbacks {
 			resp, err := cb(ctx, req)
 			if resp != nil || err != nil {
@@ -281,7 +374,7 @@ func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.ModelRequest) ite
 	}
 }
 
-func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.ModelResponse) (*session.Event, error) {
+func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.ModelResponse, budget *RunBudget) (*session.Event, error) {
 	if resp.Content == nil {
 		return nil, nil
 	}
@@ -296,44 +389,106 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.Mode
 		return nil, nil
 	}
 
+	opts := f.ExecutionOptions
+	if opts.Limits.MaxToolCallsPerTurn > 0 && len(calls) > opts.Limits.MaxToolCallsPerTurn {
+		return nil, fmt.Errorf("turn exceeded %d tool calls", opts.Limits.MaxToolCallsPerTurn)
+	}
+	if opts.Limits.MaxToolCalls > 0 && budget.ToolCalls+len(calls) > opts.Limits.MaxToolCalls {
+		return nil, fmt.Errorf("run exceeded %d tool calls", opts.Limits.MaxToolCalls)
+	}
+	budget.ToolCalls += len(calls)
+	budget.ToolCallsThisTurn += len(calls)
+
 	results := make([]content.Part, len(calls))
 	actionsList := make([]*tool.EventActions, len(calls))
-	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var fatalErr error
+	setFatal := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fatalErr == nil || (tool.IsTerminal(err) && !tool.IsTerminal(fatalErr)) {
+			fatalErr = err
+		}
+	}
 
-	for i, call := range calls {
-		wg.Add(1)
-		go func(idx int, c *content.FunctionCall) {
-			defer wg.Done()
-			toolActions := &tool.EventActions{}
-			result, err := f.executeTool(ctx, c, toolActions)
-			var part content.Part
-			if err != nil {
+	runOne := func(ctx agent.InvocationContext, idx int, c *content.FunctionCall) {
+		toolActions := &tool.EventActions{}
+		result, err := f.executeTool(ctx, c, toolActions)
+		var part content.Part
+		if err != nil {
+			if tool.IsTerminal(err) {
+				setFatal(err)
+				return
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				part = content.NewFunctionResponsePart(c.ID, c.Name, map[string]any{"error": err.Error()}, true)
+				setFatal(err)
+			} else {
 				result, isInvalid := f.handleToolError(c, err)
 				if isInvalid {
 					part = content.NewFunctionResponsePart(c.ID, c.Name, result, true)
-				} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					part = content.NewFunctionResponsePart(c.ID, c.Name, map[string]any{"error": err.Error()}, true)
-					mu.Lock()
-					if fatalErr == nil {
-						fatalErr = err
-					}
-					mu.Unlock()
 				} else {
 					part = content.NewFunctionResponsePart(c.ID, c.Name, map[string]any{"error": err.Error()}, true)
 				}
-			} else {
-				result = truncateResult(result)
-				part = content.NewFunctionResponsePart(c.ID, c.Name, result, false)
 			}
-			mu.Lock()
-			results[idx] = part
-			actionsList[idx] = toolActions
-			mu.Unlock()
-		}(i, call)
+		} else {
+			part = content.NewFunctionResponsePart(c.ID, c.Name, result, false)
+		}
+		mu.Lock()
+		results[idx] = part
+		actionsList[idx] = toolActions
+		mu.Unlock()
 	}
-	wg.Wait()
+
+	if opts.ToolScheduling == ToolSchedulingSequential {
+		for i, call := range calls {
+			runOne(ctx, i, call)
+			mu.Lock()
+			stop := fatalErr != nil
+			mu.Unlock()
+			if stop {
+				return nil, fatalErr
+			}
+		}
+	} else {
+		maxParallel := opts.MaxParallelTools
+		if maxParallel <= 0 || maxParallel > len(calls) {
+			maxParallel = len(calls)
+		}
+		batchCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		batchInvocation := ctx.WithContext(batchCtx)
+		sem := make(chan struct{}, maxParallel)
+		var wg sync.WaitGroup
+
+		for i, call := range calls {
+			sem <- struct{}{}
+			mu.Lock()
+			stopped := fatalErr != nil
+			mu.Unlock()
+			if stopped {
+				<-sem
+				break
+			}
+
+			wg.Add(1)
+			go func(idx int, c *content.FunctionCall) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if batchInvocation.Ended() {
+					return
+				}
+				runOne(batchInvocation, idx, c)
+				mu.Lock()
+				terminal := fatalErr != nil && tool.IsTerminal(fatalErr)
+				mu.Unlock()
+				if terminal {
+					cancel()
+				}
+			}(i, call)
+		}
+		wg.Wait()
+	}
 
 	if fatalErr != nil {
 		return nil, fatalErr
@@ -341,6 +496,9 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, resp *model.Mode
 
 	var mergedActions session.EventActions
 	for _, actions := range actionsList {
+		if actions == nil {
+			continue
+		}
 		if actions.Escalate {
 			mergedActions.Escalate = true
 		}
@@ -397,6 +555,9 @@ func (f *Flow) executeTool(ctx agent.InvocationContext, call *content.FunctionCa
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
+	if maxDuration := f.ExecutionOptions.Limits.MaxToolDuration; maxDuration > 0 && maxDuration < timeout {
+		timeout = maxDuration
+	}
 	toolCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	timeoutCtx := ctx.WithContext(toolCtx)
@@ -413,21 +574,49 @@ func (f *Flow) executeTool(ctx agent.InvocationContext, call *content.FunctionCa
 			args = r
 		}
 	}
+	for _, guard := range f.ExecutionOptions.BeforeToolGuards {
+		if err := guard(flowCtx, t, args); err != nil {
+			return nil, tool.NewDeniedError(err)
+		}
+	}
 
 	processCtx := tool.ContextWithActions(flowCtx, actions)
 	processCtx = tool.ContextWithState(processCtx, ctx.Session().State())
 	result, err := t.Process(processCtx, args)
 
-	for _, cb := range f.AfterToolCallbacks {
-		r, e := cb(flowCtx, t, args, result, err)
-		if r != nil || e != nil {
-			result = r
-			err = e
-			break
+	if !tool.IsTerminal(err) {
+		for _, cb := range f.AfterToolCallbacks {
+			r, e := cb(flowCtx, t, args, result, err)
+			if r != nil || e != nil {
+				result = r
+				err = e
+				break
+			}
+		}
+	}
+
+	if err == nil {
+		policy := f.ResultPolicy
+		if policy == nil {
+			policy = defaultResultPolicy
+		}
+		result, err = policy.Process(flowCtx, result)
+		if err == nil {
+			if maxBytes := f.ExecutionOptions.Limits.MaxToolResultBytes; maxBytes > 0 {
+				size, sizeErr := toolResultBytes(result)
+				if sizeErr != nil {
+					err = fmt.Errorf("measure tool result: %w", sizeErr)
+				} else if size > maxBytes {
+					err = tool.NewDeniedError(fmt.Errorf("tool result exceeded %d bytes", maxBytes))
+				}
+			}
 		}
 	}
 
 	if err != nil {
+		if tool.IsTerminal(err) {
+			return nil, err
+		}
 		for _, cb := range f.OnToolErrorCallbacks {
 			r, e := cb(flowCtx, t, args, err)
 			if r != nil || e != nil {
@@ -578,6 +767,11 @@ func (f *Flow) buildEvent(ctx agent.InvocationContext, resp *model.ModelResponse
 	event.Partial = resp.Partial
 	event.Usage = resp.Usage
 	event.FinishReason = resp.FinishReason
+	event.ModelVersion = resp.ModelVersion
+	event.TurnComplete = resp.TurnComplete
+	event.Interrupted = resp.Interrupted
+	event.ErrorCode = resp.ErrorCode
+	event.ErrorMessage = resp.ErrorMessage
 	if resp.Content != nil {
 		event.ModelResponse = resp.Content
 	}
@@ -609,24 +803,4 @@ func eventHasFunctionCalls(e *session.Event) bool {
 		}
 	}
 	return false
-}
-
-func truncateResult(result map[string]any) map[string]any {
-	if result == nil {
-		return nil
-	}
-	truncated := false
-	for k, v := range result {
-		if s, ok := v.(string); ok {
-			t := truncate.Truncate(s, truncate.Options{})
-			if t.Truncated {
-				result[k] = t.Content
-				truncated = true
-			}
-		}
-	}
-	if truncated {
-		result["_output_truncated"] = true
-	}
-	return result
 }

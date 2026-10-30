@@ -27,8 +27,8 @@ func TestTruncateOverLineLimit(t *testing.T) {
 	if !result.Truncated {
 		t.Error("should truncate large output")
 	}
-	if result.OutputPath == "" {
-		t.Error("should have output path")
+	if result.OutputPath != "" {
+		t.Error("pure truncation should not spill to disk")
 	}
 	if !strings.Contains(result.Content, "truncated") {
 		t.Error("should mention truncation")
